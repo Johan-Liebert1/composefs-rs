@@ -113,7 +113,7 @@ pub fn create_image(
             while let Some(entry) = oci::tar::get_entry(&mut layer_stream)? {
                 process_entry(&mut filesystem, entry)?;
             }
-        } else if false {
+        } else {
             while let Some(entry) = oci::tar::get_entry_new(&mut layer_stream)? {
                 process_entry(&mut filesystem, entry)?;
             }

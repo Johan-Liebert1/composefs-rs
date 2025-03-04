@@ -3,7 +3,7 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
-    io::Read,
+    io::{Read, Seek},
     os::unix::prelude::{OsStrExt, OsStringExt},
     path::PathBuf,
 };
@@ -219,7 +219,6 @@ pub fn get_entry_new<R: Read>(
         etrace!("entry_size: {entry_size}");
 
         // An external ref, i.e. a SHA256 hash
-        // Q: Will this have padding after zstd decompression?
         if entry_size > INLINE_CONTENT_MAX {
             let stored_size = (entry_size + 511) & !511;
 
@@ -229,11 +228,12 @@ pub fn get_entry_new<R: Read>(
                 0
             };
 
+            etrace!("Padding: {padding}");
+
             let mut id = Sha256HashValue::EMPTY;
 
             // discard the padding
             let mut data = vec![0; id.len() + padding];
-
             entry.read(&mut data)?;
 
             id.clone_from_slice(&data[..32]);
@@ -248,10 +248,10 @@ pub fn get_entry_new<R: Read>(
                         }
                     };
 
-                    // etrace!("External file: {}", hex::encode(id));
-
                     tar_entry.item =
                         TarItem::Leaf(LeafContent::ExternalFile(id, entry_size as u64));
+
+                    etrace!("Read external data: {}", hex::encode(id));
 
                     // Next entry will be read after we process this one
                     // TODO:? We can implement iterator for Splitstream
@@ -276,7 +276,7 @@ pub fn get_entry_new<R: Read>(
 
         match header.entry_type() {
             EntryType::Regular | EntryType::Continuous => {
-                let mut content = vec![0; entry_size];
+                let mut content = vec![0; (entry_size + 511) & 511];
                 entry.read(&mut content)?;
                 tar_entry.item = TarItem::Leaf(LeafContent::InlineFile(content));
             }
@@ -287,6 +287,7 @@ pub fn get_entry_new<R: Read>(
                 tar_entry.path = {
                     // only get absolute path for hard links, for symlinks we want relative paths
                     if let Some(path) = get_path_from_pax(&mut entry, PAX_LINKPATH, is_hard_link)? {
+                        etrace!("Got path '{path:?}' from pax for symlink");
                         path
                     } else {
                         let link_name = entry.header().link_name()?;

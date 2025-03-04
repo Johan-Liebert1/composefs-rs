@@ -5,7 +5,7 @@
 
 use std::{
     fmt::Debug,
-    io::{BufReader, Read, Seek, Write},
+    io::{BufReader, Read, Write},
 };
 
 use anyhow::{bail, Result};
@@ -163,7 +163,9 @@ impl SplitStreamWriter<'_> {
             sha256.update(data);
             sha256.update(&padding);
         }
+
         let id = self.repo.ensure_object(data)?;
+
         self.write_reference(id, padding)
     }
 
@@ -192,6 +194,7 @@ pub struct SplitStreamReader<R: Read> {
     pub refs: DigestMap,
     inline_bytes: usize,
     tar_extract: bool,
+    pub skip_padding: Option<usize>,
 }
 
 impl<R: Read> std::fmt::Debug for SplitStreamReader<R> {
@@ -258,6 +261,7 @@ impl<R: Read> SplitStreamReader<R> {
             refs,
             inline_bytes: 0,
             tar_extract: false,
+            skip_padding: None,
         })
     }
 
@@ -408,25 +412,19 @@ impl<R: Read> SplitStreamReader<R> {
     }
 }
 
-
-impl<F: Read> Seek for SplitStreamReader<F> {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        todo!()
-    }
-}
-
 impl<F: Read> Read for SplitStreamReader<F> {
     fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        // etrace!(
-        //     "Called read for splitstream with request for data with len: {}.",
-        //     data.len()
-        // );
-
         // if we're extracting tar, we are okay with an external chunk
         let ret = match self.ensure_chunk(true, self.tar_extract, 1) {
             Ok(ChunkType::Eof) => Ok(0),
 
             Ok(ChunkType::Inline) => {
+                if let Some(padding) = self.skip_padding {
+                    etrace!("Skipping padding: {padding} bytes");
+                    self.discard_padding(padding);
+                    self.skip_padding = None;
+                }
+
                 let n_bytes = std::cmp::min(data.len(), self.inline_bytes);
                 self.decoder.read_exact(&mut data[0..n_bytes])?;
                 self.inline_bytes -= n_bytes;
@@ -434,10 +432,21 @@ impl<F: Read> Read for SplitStreamReader<F> {
             }
 
             Ok(ChunkType::External(id)) if self.tar_extract => {
-                etrace!("Found external chunk with id: {}", hex::encode(id));
-
                 data[..id.len()].copy_from_slice(&id);
-                self.decoder.read_exact(&mut data[id.len()..])?;
+                // self.decoder.read_exact(&mut data[id.len()..])?;
+
+                // If there's some padding we need to take care of
+                if data.len() > id.len() {
+                    // We just read an external chunk, we shouldn't have any pending inline chunks
+                    // left to read
+                    etrace!(
+                        "data.len(): {}, id.len(): {}. Setting Padding to: {}",
+                        data.len(),
+                        id.len(),
+                        data.len() - id.len()
+                    );
+                    self.skip_padding = Some(data.len() - id.len());
+                }
 
                 Ok(data.len())
             }
