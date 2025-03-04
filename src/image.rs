@@ -20,6 +20,34 @@ pub struct Stat {
     pub xattrs: RefCell<BTreeMap<Box<OsStr>, Box<[u8]>>>,
 }
 
+impl Default for Stat {
+    fn default() -> Self {
+        Self {
+            st_mode: u32::MAX,
+            st_uid: u32::MAX,
+            st_gid: u32::MAX,
+            st_mtim_sec: -1,
+            xattrs: RefCell::new(BTreeMap::new()),
+        }
+    }
+}
+
+// Might be a bit weird as xattrs cannot be passed as a value here
+// TODO: Turn this into a simple `impl`
+impl TryFrom<&tar::Header> for Stat {
+    type Error = anyhow::Error;
+
+    fn try_from(header: &tar::Header) -> Result<Self, Self::Error> {
+        Ok(Self {
+            st_uid: header.uid()? as u32,
+            st_gid: header.gid()? as u32,
+            st_mode: header.mode()?,
+            st_mtim_sec: header.mtime()? as i64,
+            xattrs: RefCell::new(BTreeMap::new()),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum LeafContent {
     InlineFile(Vec<u8>),
@@ -193,13 +221,7 @@ impl FileSystem {
     pub fn new() -> Self {
         FileSystem {
             root: Directory {
-                stat: Stat {
-                    st_mode: u32::MAX, // assigned later
-                    st_uid: u32::MAX,  // assigned later
-                    st_gid: u32::MAX,  // assigned later
-                    st_mtim_sec: -1,   // assigned later
-                    xattrs: RefCell::new(BTreeMap::new()),
-                },
+                stat: Stat::default(),
                 entries: vec![],
             },
         }

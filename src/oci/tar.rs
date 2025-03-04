@@ -10,16 +10,21 @@ use std::{
 
 use anyhow::{bail, ensure, Result};
 use rustix::fs::makedev;
-use tar::{EntryType, Header, PaxExtensions};
+use tar::{Entry, EntryType, Header, PaxExtensions};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
-    dumpfile,
+    dumpfile, etrace,
+    fsverity::{FsVerityHashValue, Sha256HashValue},
     image::{LeafContent, Stat},
     splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
 };
+
+// Keywords for PAX extended header records.
+const PAX_PATH: &str = "path";
+const PAX_LINKPATH: &str = "linkpath";
 
 fn read_header<R: Read>(reader: &mut R) -> Result<Option<Header>> {
     let mut header = Header::new_gnu();
@@ -99,14 +104,15 @@ pub async fn split_async(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum TarItem {
+    #[default]
     Directory,
     Leaf(LeafContent),
     Hardlink(OsString),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TarEntry {
     pub path: PathBuf,
     pub stat: Stat,
@@ -156,6 +162,193 @@ fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -
     }
 }
 
+/// Paths with > 100 chars are stored  in pax extensions
+/// so, we check if this exists
+fn get_path_from_pax<R: Read>(
+    entry: &mut Entry<'_, &mut SplitStreamReader<R>>,
+    key: &str,
+    absolute: bool,
+) -> Result<Option<PathBuf>, anyhow::Error> {
+    if let Ok(Some(ext)) = entry.pax_extensions() {
+        for e in ext {
+            let e = e?;
+
+            if e.key()? == key {
+                let path = PathBuf::from(e.value()?);
+                // convert to absolute path
+                return Ok(Some(if absolute {
+                    PathBuf::from("/").join(path)
+                } else {
+                    path
+                }));
+            };
+        }
+    };
+
+    Ok(None)
+}
+
+pub fn get_entry_new<R: Read>(
+    // TODO: pass an archive here
+    splitstream_reader: &mut SplitStreamReader<R>,
+) -> Result<Option<TarEntry>> {
+    splitstream_reader.prep_for_archive_extract();
+
+    let mut archive = tar::Archive::new(&mut *splitstream_reader);
+
+    let mut entries = match archive.entries() {
+        Ok(e) => e,
+        Err(_) => todo!(),
+    };
+
+    let mut tar_entry = TarEntry::default();
+
+    if let Some(entry) = entries.next() {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                bail!("Error while reading entry: {e:?}");
+            }
+        };
+
+        let header = entry.header();
+        let entry_size = header.entry_size()? as usize;
+
+        tar_entry.stat = header.try_into()?;
+
+        etrace!("entry_size: {entry_size}");
+
+        // An external ref, i.e. a SHA256 hash
+        // Q: Will this have padding after zstd decompression?
+        if entry_size > INLINE_CONTENT_MAX {
+            let stored_size = (entry_size + 511) & !511;
+
+            let padding = if stored_size > entry_size {
+                stored_size - entry_size
+            } else {
+                0
+            };
+
+            let mut id = Sha256HashValue::EMPTY;
+
+            // discard the padding
+            let mut data = vec![0; id.len() + padding];
+
+            entry.read(&mut data)?;
+
+            id.clone_from_slice(&data[..32]);
+
+            match entry.header().entry_type() {
+                EntryType::Regular | EntryType::Continuous => {
+                    tar_entry.path = {
+                        if let Some(path) = get_path_from_pax(&mut entry, PAX_PATH, true)? {
+                            path
+                        } else {
+                            PathBuf::from("/").join(entry.header().path()?)
+                        }
+                    };
+
+                    // etrace!("External file: {}", hex::encode(id));
+
+                    tar_entry.item =
+                        TarItem::Leaf(LeafContent::ExternalFile(id, entry_size as u64));
+
+                    // Next entry will be read after we process this one
+                    // TODO:? We can implement iterator for Splitstream
+                    return Ok(Some(tar_entry));
+                }
+
+                _ => bail!(
+                    "Unsupported external-chunked entry {:?} {}",
+                    entry.header(),
+                    hex::encode(id)
+                ),
+            };
+        }
+
+        let header = entry.header();
+
+        etrace!(
+            "gonna parse some inline content: type: {:#?}, path: {:?}",
+            header.entry_type(),
+            header.path()
+        );
+
+        match header.entry_type() {
+            EntryType::Regular | EntryType::Continuous => {
+                let mut content = vec![0; entry_size];
+                entry.read(&mut content)?;
+                tar_entry.item = TarItem::Leaf(LeafContent::InlineFile(content));
+            }
+
+            EntryType::Link | EntryType::Symlink => {
+                let is_hard_link = entry.header().entry_type() == EntryType::Link;
+
+                tar_entry.path = {
+                    // only get absolute path for hard links, for symlinks we want relative paths
+                    if let Some(path) = get_path_from_pax(&mut entry, PAX_LINKPATH, is_hard_link)? {
+                        path
+                    } else {
+                        let link_name = entry.header().link_name()?;
+
+                        match link_name {
+                            Some(l) => PathBuf::from("/").join(l),
+                            None => bail!("Hard link without a path?"),
+                        }
+                    }
+                };
+
+                tar_entry.item = if is_hard_link {
+                    TarItem::Hardlink(tar_entry.path.clone().into())
+                } else {
+                    TarItem::Leaf(LeafContent::Symlink(tar_entry.path.clone().into()))
+                };
+            }
+
+            EntryType::GNULongName => todo!(),
+            EntryType::GNULongLink => todo!(),
+            EntryType::GNUSparse => todo!(),
+            EntryType::XGlobalHeader => todo!(),
+
+            EntryType::Fifo => tar_entry.item = TarItem::Leaf(LeafContent::Fifo),
+
+            EntryType::Char | EntryType::Block => {
+                let (maj, min) = match (header.device_major()?, header.device_minor()?) {
+                    (Some(major), Some(minor)) => (major, minor),
+
+                    _ => bail!("Device entry without device numbers?"),
+                };
+
+                tar_entry.item = if header.entry_type() == EntryType::Char {
+                    TarItem::Leaf(LeafContent::CharacterDevice(makedev(maj, min)))
+                } else {
+                    TarItem::Leaf(LeafContent::BlockDevice(makedev(maj, min)))
+                };
+            }
+
+            EntryType::Directory => {
+                tar_entry.path = {
+                    if let Some(path) = get_path_from_pax(&mut entry, PAX_PATH, true)? {
+                        path
+                    } else {
+                        PathBuf::from("/").join(entry.header().path()?)
+                    }
+                };
+
+                tar_entry.item = TarItem::Directory;
+            }
+
+            EntryType::XHeader => {}
+
+            _ => todo!(),
+        };
+    }
+
+    // etrace!("taritem: {tar_entry:#?}");
+
+    return Ok(Some(tar_entry));
+}
+
 pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<TarEntry>> {
     let mut gnu_longlink: Vec<u8> = vec![];
     let mut gnu_longname: Vec<u8> = vec![];
@@ -174,6 +367,11 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
 
         let size = header.entry_size()?;
 
+        etrace!(
+            "actual_size: {size}, stored_size: {}",
+            ((size + 511) & !511)
+        );
+
         let item = match reader.read_exact(size as usize, ((size + 511) & !511) as usize)? {
             SplitStreamData::External(id) => match header.entry_type() {
                 EntryType::Regular | EntryType::Continuous => {
@@ -181,6 +379,7 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                         size as usize > INLINE_CONTENT_MAX,
                         "Splitstream incorrectly stored a small ({size} byte) file external"
                     );
+                    etrace!("External file: {}", hex::encode(id));
                     TarItem::Leaf(LeafContent::ExternalFile(id, size))
                 }
                 _ => bail!(
@@ -189,18 +388,22 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                     hex::encode(id)
                 ),
             },
+
             SplitStreamData::Inline(content) => match header.entry_type() {
                 EntryType::GNULongLink => {
                     gnu_longlink.extend(content);
                     continue;
                 }
+
                 EntryType::GNULongName => {
                     gnu_longname.extend(content);
                     continue;
                 }
+
                 EntryType::XGlobalHeader => {
                     todo!();
                 }
+
                 EntryType::XHeader => {
                     for item in PaxExtensions::new(&content) {
                         let extension = item?;
@@ -217,39 +420,49 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                     }
                     continue;
                 }
+
                 EntryType::Directory => TarItem::Directory,
+
                 EntryType::Regular | EntryType::Continuous => {
                     ensure!(
                         content.len() <= INLINE_CONTENT_MAX,
                         "Splitstream incorrectly stored a large ({} byte) file inline",
                         content.len()
                     );
+
+                    // etrace!("Regular or Continuous file. Content: {content:?}");
+
                     TarItem::Leaf(LeafContent::InlineFile(content))
                 }
+
                 EntryType::Link => TarItem::Hardlink({
                     let Some(link_name) = header.link_name_bytes() else {
                         bail!("link without a name?")
                     };
                     OsString::from(path_from_tar(pax_longlink, gnu_longlink, &link_name))
                 }),
+
                 EntryType::Symlink => TarItem::Leaf(LeafContent::Symlink({
                     let Some(link_name) = header.link_name_bytes() else {
                         bail!("symlink without a name?")
                     };
                     symlink_target_from_tar(pax_longlink, gnu_longlink, &link_name)
                 })),
+
                 EntryType::Block => TarItem::Leaf(LeafContent::BlockDevice(
                     match (header.device_major()?, header.device_minor()?) {
                         (Some(major), Some(minor)) => makedev(major, minor),
                         _ => bail!("Device entry without device numbers?"),
                     },
                 )),
+
                 EntryType::Char => TarItem::Leaf(LeafContent::CharacterDevice(
                     match (header.device_major()?, header.device_minor()?) {
                         (Some(major), Some(minor)) => makedev(major, minor),
                         _ => bail!("Device entry without device numbers?"),
                     },
                 )),
+
                 EntryType::Fifo => TarItem::Leaf(LeafContent::Fifo),
                 _ => {
                     todo!("Unsupported entry {:?}", header);

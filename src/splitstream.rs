@@ -3,22 +3,36 @@
  * See doc/splitstream.md
  */
 
-use std::io::{BufReader, Read, Write};
+use std::{
+    fmt::Debug,
+    io::{BufReader, Read, Seek, Write},
+};
 
 use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
 use zstd::stream::{read::Decoder, write::Encoder};
 
 use crate::{
+    etrace,
     fsverity::{FsVerityHashValue, Sha256HashValue},
     repository::Repository,
     util::read_exactish,
 };
 
-#[derive(Debug)]
 pub struct DigestMapEntry {
     pub body: Sha256HashValue,
     pub verity: Sha256HashValue,
+}
+
+impl Debug for DigestMapEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "< Body: {}, Verity: {} >",
+            hex::encode(self.body),
+            hex::encode(self.verity)
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -177,6 +191,7 @@ pub struct SplitStreamReader<R: Read> {
     decoder: Decoder<'static, BufReader<R>>,
     pub refs: DigestMap,
     inline_bytes: usize,
+    tar_extract: bool,
 }
 
 impl<R: Read> std::fmt::Debug for SplitStreamReader<R> {
@@ -215,6 +230,8 @@ enum ChunkType {
 }
 
 impl<R: Read> SplitStreamReader<R> {
+    /// Creates a new zstd decoder using `reader`
+    /// Reads the number of map_entries in the file, puts them in a vec
     pub fn new(reader: R) -> Result<SplitStreamReader<R>> {
         let mut decoder = Decoder::new(reader)?;
 
@@ -240,6 +257,7 @@ impl<R: Read> SplitStreamReader<R> {
             decoder,
             refs,
             inline_bytes: 0,
+            tar_extract: false,
         })
     }
 
@@ -249,22 +267,32 @@ impl<R: Read> SplitStreamReader<R> {
         ext_ok: bool,
         expected_bytes: usize,
     ) -> Result<ChunkType> {
+        etrace!("inline_bytes: {}", self.inline_bytes);
+
         if self.inline_bytes == 0 {
             match read_u64_le(&mut self.decoder)? {
                 None => {
                     if !eof_ok {
                         bail!("Unexpected EOF when parsing splitstream");
                     }
+
                     return Ok(ChunkType::Eof);
                 }
+
                 Some(0) => {
-                    if !ext_ok {
-                        bail!("Unexpected external reference when parsing splitstream");
-                    }
                     let mut id = Sha256HashValue::EMPTY;
                     self.decoder.read_exact(&mut id)?;
+
+                    if !ext_ok {
+                        bail!(
+                            "Unexpected external reference {} when parsing splitstream",
+                            hex::encode(id)
+                        );
+                    }
+
                     return Ok(ChunkType::External(id));
                 }
+
                 Some(size) => {
                     self.inline_bytes = size;
                 }
@@ -374,20 +402,54 @@ impl<R: Read> SplitStreamReader<R> {
             None => bail!("Reference is not found in splitstream"),
         }
     }
+
+    pub fn prep_for_archive_extract(&mut self) {
+        self.tar_extract = true;
+    }
+}
+
+
+impl<F: Read> Seek for SplitStreamReader<F> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        todo!()
+    }
 }
 
 impl<F: Read> Read for SplitStreamReader<F> {
     fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        match self.ensure_chunk(true, false, 1) {
+        // etrace!(
+        //     "Called read for splitstream with request for data with len: {}.",
+        //     data.len()
+        // );
+
+        // if we're extracting tar, we are okay with an external chunk
+        let ret = match self.ensure_chunk(true, self.tar_extract, 1) {
             Ok(ChunkType::Eof) => Ok(0),
+
             Ok(ChunkType::Inline) => {
                 let n_bytes = std::cmp::min(data.len(), self.inline_bytes);
                 self.decoder.read_exact(&mut data[0..n_bytes])?;
                 self.inline_bytes -= n_bytes;
                 Ok(n_bytes)
             }
+
+            Ok(ChunkType::External(id)) if self.tar_extract => {
+                etrace!("Found external chunk with id: {}", hex::encode(id));
+
+                data[..id.len()].copy_from_slice(&id);
+                self.decoder.read_exact(&mut data[id.len()..])?;
+
+                Ok(data.len())
+            }
+
+            // As `ext_ok` is false in `ensure_chunk`
             Ok(ChunkType::External(..)) => unreachable!(),
+
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
-        }
+        };
+
+        etrace!("Returned: {ret:?}\n");
+
+        return ret;
     }
 }

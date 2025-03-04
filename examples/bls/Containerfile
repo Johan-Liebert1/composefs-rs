@@ -1,15 +1,21 @@
-# Need 6.12 kernel from rawhide
-FROM fedora:rawhide
-COPY extra /
-COPY cfsctl /usr/bin
-RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
-    set -eux
-    dnf --setopt keepcache=1 install --allowerasing -y systemd util-linux skopeo composefs strace dosfstools kernel
-    systemctl enable systemd-networkd
-    passwd -d root
-    mkdir /sysroot
-    mkdir /composefs-meta
-    mv /boot /composefs-meta
-    mkdir /boot
-EOF
-RUN true  # hack to get an extra layer
+# # Need 6.12 kernel from rawhide
+# FROM fedora:rawhide
+# COPY extra /
+# COPY cfsctl /usr/bin
+# RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
+#     set -eux
+#     dnf --setopt keepcache=1 install --allowerasing -y systemd util-linux skopeo composefs strace dosfstools kernel
+#     systemctl enable systemd-networkd
+#     passwd -d root
+#     mkdir /sysroot
+#     mkdir /composefs-meta
+#     mv /boot /composefs-meta
+#     mkdir /boot
+# EOF
+# RUN true  # hack to get an extra layer
+
+FROM alpine-curl
+
+RUN echo "hi" > ABCDEFGHIJKLMNOPQRSTUVWXYZ_ABCDEFGHIJKLMNOPQRSTUVWXYZ_ABCDEFGHIJKLMNOPQRSTUVWXYZ_ABCDEFGHIJKLMNOPQRSTUVWXYZ && \
+    ln -s ABCDEFGHIJKLMNOPQRSTUVWXYZ_ABCDEFGHIJKLMNOPQRSTUVWXYZ_ABCDEFGHIJKLMNOPQRSTUVWXYZ_ABCDEFGHIJKLMNOPQRSTUVWXYZ alphabet_symlink && \
+    ln ABCDEFGHIJKLMNOPQRSTUVWXYZ_ABCDEFGHIJKLMNOPQRSTUVWXYZ_ABCDEFGHIJKLMNOPQRSTUVWXYZ_ABCDEFGHIJKLMNOPQRSTUVWXYZ alphabet_hardlink
