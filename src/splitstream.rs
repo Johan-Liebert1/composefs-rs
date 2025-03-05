@@ -5,7 +5,7 @@
 
 use std::{
     fmt::Debug,
-    io::{BufReader, Read, Write},
+    io::{BufReader, Read, Seek, Write},
 };
 
 use anyhow::{bail, Result};
@@ -271,8 +271,8 @@ impl<R: Read> SplitStreamReader<R> {
         ext_ok: bool,
         expected_bytes: usize,
     ) -> Result<ChunkType> {
-        etrace!("inline_bytes: {}", self.inline_bytes);
-
+        // Only try to read if there are no inline bytes left to read
+        // Else we're still in the process of reading inline bytes
         if self.inline_bytes == 0 {
             match read_u64_le(&mut self.decoder)? {
                 None => {
@@ -298,6 +298,7 @@ impl<R: Read> SplitStreamReader<R> {
                 }
 
                 Some(size) => {
+                    etrace!("inline_bytes was 0, setting it to: {}", size);
                     self.inline_bytes = size;
                 }
             }
@@ -307,6 +308,7 @@ impl<R: Read> SplitStreamReader<R> {
             bail!("Unexpectedly small inline content when parsing splitstream");
         }
 
+        etrace!("Inline bytes > 0 ({}) so returning that", self.inline_bytes);
         Ok(ChunkType::Inline)
     }
 
@@ -412,8 +414,17 @@ impl<R: Read> SplitStreamReader<R> {
     }
 }
 
+
+impl<F: Read> Seek for SplitStreamReader<F> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        todo!()
+    }
+}
+
 impl<F: Read> Read for SplitStreamReader<F> {
     fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
+        etrace!("--- Req to req {} bytes", data.len());
+
         // if we're extracting tar, we are okay with an external chunk
         let ret = match self.ensure_chunk(true, self.tar_extract, 1) {
             Ok(ChunkType::Eof) => Ok(0),
@@ -428,6 +439,7 @@ impl<F: Read> Read for SplitStreamReader<F> {
                 let n_bytes = std::cmp::min(data.len(), self.inline_bytes);
                 self.decoder.read_exact(&mut data[0..n_bytes])?;
                 self.inline_bytes -= n_bytes;
+                etrace!("Read {n_bytes} from inline_bytes now value is: {}", self.inline_bytes);
                 Ok(n_bytes)
             }
 
@@ -440,11 +452,13 @@ impl<F: Read> Read for SplitStreamReader<F> {
                     // We just read an external chunk, we shouldn't have any pending inline chunks
                     // left to read
                     etrace!(
-                        "data.len(): {}, id.len(): {}. Setting Padding to: {}",
+                        "data.len(): {}, id.len(): {}. Setting Padding to: {}, for external chunk {}",
                         data.len(),
                         id.len(),
-                        data.len() - id.len()
+                        data.len() - id.len(),
+                        hex::encode(id)
                     );
+
                     self.skip_padding = Some(data.len() - id.len());
                 }
 

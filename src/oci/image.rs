@@ -18,12 +18,12 @@ pub fn process_entry(filesystem: &mut FileSystem, entry: oci::tar::TarEntry) -> 
     let mut components = entry.path.components();
 
     let Some(Component::Normal(filename)) = components.next_back() else {
-        bail!("Empty filename")
+        bail!("Empty filename. Processing entry: {entry:#?}")
     };
 
     let mut dir = &mut filesystem.root;
 
-    println!("dir: {dir:?}");
+    // println!("dir: {dir:?}");
     // println!("entry: {entry:?}");
 
     for component in components {
@@ -114,9 +114,7 @@ pub fn create_image(
                 process_entry(&mut filesystem, entry)?;
             }
         } else {
-            while let Some(entry) = oci::tar::get_entry_new(&mut layer_stream)? {
-                process_entry(&mut filesystem, entry)?;
-            }
+            oci::tar::get_entry_new(&mut layer_stream, &mut filesystem)?;
         }
 
         exit(0)
