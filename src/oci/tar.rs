@@ -3,21 +3,20 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
-    io::{Read, Seek},
+    io::Read,
     os::unix::prelude::{OsStrExt, OsStringExt},
     path::PathBuf,
 };
 
 use anyhow::{bail, ensure, Result};
-use rustix::fs::makedev;
+use rustix::{fs::makedev, path::Arg};
 use tar::{Entry, EntryType, Header, PaxExtensions};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
     dumpfile, etrace,
     fsverity::{FsVerityHashValue, Sha256HashValue},
-    image::{FileSystem, LeafContent, Stat},
-    oci::image::process_entry,
+    image::{LeafContent, Stat, StatXattrs},
     splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
@@ -110,6 +109,8 @@ pub enum TarItem {
     #[default]
     Directory,
     Leaf(LeafContent),
+    /// Contains the target of the link
+    /// The actual link path should be in TarEntry.path
     Hardlink(OsString),
 }
 
@@ -165,10 +166,11 @@ fn symlink_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -
 
 /// Paths with > 100 chars are stored  in pax extensions
 /// so, we check if this exists
-fn get_path_from_pax<R: Read>(
+fn get_pax_extension<R: Read>(
     entry: &mut Entry<'_, &mut SplitStreamReader<R>>,
     key: &str,
-    absolute: bool,
+    get_absolute_path: bool,
+    xattrs: &mut StatXattrs,
 ) -> Result<Option<PathBuf>, anyhow::Error> {
     if let Ok(Some(ext)) = entry.pax_extensions() {
         for e in ext {
@@ -177,12 +179,17 @@ fn get_path_from_pax<R: Read>(
             if e.key()? == key {
                 let path = PathBuf::from(e.value()?);
                 // convert to absolute path
-                return Ok(Some(if absolute {
+                return Ok(Some(if get_absolute_path {
                     PathBuf::from("/").join(path)
                 } else {
                     path
                 }));
             };
+
+            if let Some(xattr) = key.strip_prefix("SCHILY.xattr.") {
+                let value = Box::from(e.value_bytes());
+                xattrs.insert(Box::from(OsStr::new(xattr)), value);
+            }
         }
     };
 
@@ -191,7 +198,7 @@ fn get_path_from_pax<R: Read>(
 
 fn parse_external_entry<R: Read>(
     entry: &mut Entry<'_, &mut SplitStreamReader<R>>,
-) -> Result<TarEntry, anyhow::Error> {
+) -> Result<(TarEntry, usize), anyhow::Error> {
     let header = entry.header();
     let entry_size = header.entry_size()? as usize;
 
@@ -206,12 +213,14 @@ fn parse_external_entry<R: Read>(
         0
     };
 
-    etrace!("Padding: {padding}");
+    etrace!("Padding for extrenal entry: {padding}");
 
     let mut id = Sha256HashValue::EMPTY;
 
-    // discard the padding
-    let mut data = vec![0; id.len() + padding];
+    // To discard the padding
+    // We need to do this here because the padding is
+    // preceeded by a u64 which contains the inline content length
+    let mut data = vec![0; id.len()];
     entry.read(&mut data)?;
 
     id.clone_from_slice(&data[..32]);
@@ -219,12 +228,21 @@ fn parse_external_entry<R: Read>(
     match entry.header().entry_type() {
         EntryType::Regular | EntryType::Continuous => {
             tar_entry.path = {
-                if let Some(path) = get_path_from_pax(entry, PAX_PATH, true)? {
+                if let Some(path) = get_pax_extension(
+                    entry,
+                    PAX_PATH,
+                    true,
+                    &mut tar_entry.stat.xattrs.borrow_mut(),
+                )? {
                     path
                 } else {
                     PathBuf::from("/").join(entry.header().path()?)
                 }
             };
+
+            if tar_entry.path.as_str().unwrap().contains("ca-certificates") {
+                etrace!("ca-certificates path: {:?}", tar_entry.path);
+            }
 
             tar_entry.item = TarItem::Leaf(LeafContent::ExternalFile(id, entry_size as u64));
 
@@ -232,7 +250,6 @@ fn parse_external_entry<R: Read>(
 
             // Next entry will be read after we process this one
             // TODO:? We can implement iterator for Splitstream
-
             etrace!("After external entry processing");
         }
 
@@ -243,13 +260,16 @@ fn parse_external_entry<R: Read>(
         ),
     };
 
-    return Ok(tar_entry);
+    return Ok((tar_entry, padding));
 }
 
 fn parse_internal_entry<R: Read>(
     entry: &mut Entry<'_, &mut SplitStreamReader<R>>,
-) -> Result<TarEntry, anyhow::Error> {
+) -> Result<(TarEntry, usize), anyhow::Error> {
+    let mut bytes_read = 0;
+
     let header = entry.header();
+
     let entry_size = header.entry_size()? as usize;
 
     let mut tar_entry = TarEntry::default();
@@ -263,18 +283,27 @@ fn parse_internal_entry<R: Read>(
 
     match header.entry_type() {
         EntryType::Regular | EntryType::Continuous => {
-            let mut content = vec![0; (entry_size + 511) & 511];
-            entry.read(&mut content)?;
+            // tar will always only read however long the content length is
+            // in the header. It doesn't take into account the length of buffer
+            // so there's no point in trying to read more
+            let mut content = vec![0; entry_size];
+
+            bytes_read = entry.read(&mut content)?;
+
+            etrace!("content len: {}, read_bytes: {bytes_read}", content.len());
 
             tar_entry.path = {
-                if let Some(path) = get_path_from_pax(entry, PAX_LINKPATH, true)? {
+                if let Some(path) = get_pax_extension(
+                    entry,
+                    PAX_PATH,
+                    true,
+                    &mut tar_entry.stat.xattrs.borrow_mut(),
+                )? {
                     path
                 } else {
                     PathBuf::from("/").join(entry.header().path()?)
                 }
             };
-
-            etrace!("{:?}", content);
 
             tar_entry.item = TarItem::Leaf(LeafContent::InlineFile(content));
         }
@@ -284,8 +313,27 @@ fn parse_internal_entry<R: Read>(
 
             tar_entry.path = {
                 // only get absolute path for hard links, for symlinks we want relative paths
-                if let Some(path) = get_path_from_pax(entry, PAX_LINKPATH, is_hard_link)? {
+                if let Some(path) = get_pax_extension(
+                    entry,
+                    PAX_PATH,
+                    true,
+                    &mut tar_entry.stat.xattrs.borrow_mut(),
+                )? {
                     etrace!("Got path '{path:?}' from pax for symlink");
+                    path
+                } else {
+                    PathBuf::from("/").join(entry.header().path()?)
+                }
+            };
+
+            let link_name = {
+                // only get absolute path for hard links, for symlinks we want relative paths
+                if let Some(path) = get_pax_extension(
+                    entry,
+                    PAX_LINKPATH,
+                    is_hard_link,
+                    &mut tar_entry.stat.xattrs.borrow_mut(),
+                )? {
                     path
                 } else {
                     let link_name = entry.header().link_name()?;
@@ -298,9 +346,9 @@ fn parse_internal_entry<R: Read>(
             };
 
             tar_entry.item = if is_hard_link {
-                TarItem::Hardlink(tar_entry.path.clone().into())
+                TarItem::Hardlink(link_name.into())
             } else {
-                TarItem::Leaf(LeafContent::Symlink(tar_entry.path.clone().into()))
+                TarItem::Leaf(LeafContent::Symlink(link_name.into()))
             };
         }
 
@@ -327,7 +375,12 @@ fn parse_internal_entry<R: Read>(
 
         EntryType::Directory => {
             tar_entry.path = {
-                if let Some(path) = get_path_from_pax(entry, PAX_PATH, true)? {
+                if let Some(path) = get_pax_extension(
+                    entry,
+                    PAX_PATH,
+                    true,
+                    &mut tar_entry.stat.xattrs.borrow_mut(),
+                )? {
                     path
                 } else {
                     PathBuf::from("/").join(entry.header().path()?)
@@ -342,30 +395,29 @@ fn parse_internal_entry<R: Read>(
         _ => todo!(),
     };
 
-    return Ok(tar_entry);
+    return Ok((tar_entry, bytes_read));
 }
 
 pub fn get_entry_new<R: Read>(
     // TODO: pass an archive here
     splitstream_reader: &mut SplitStreamReader<R>,
-    filesystem: &mut FileSystem,
-) -> Result<()> {
+) -> Result<Option<TarEntry>> {
     splitstream_reader.prep_for_archive_extract();
 
     // We need to keep creating a new archive so that it reads a header for us
-    // The tar crate internally keeps track of the previous header and tries to 
-    // skip the content length found in the previous header. 
+    // The tar crate internally keeps track of the previous header and tries to
+    // skip the content length found in the previous header.
     // This is a problem for external entries, as if an external entry has 10240 bytes
     // but we only store 32 bytes + some padding; on next iteration of an entry, the tar
     // crate will try to skip the next (10240 + 511) & !511 bytes
     let mut archive = tar::Archive::new(&mut *splitstream_reader);
 
-    let entries = match archive.entries() {
+    let mut entries = match archive.entries() {
         Ok(e) => e,
         Err(_) => todo!(),
     };
 
-    for entry in entries.peekable() {
+    if let Some(entry) = entries.next() {
         etrace!("----------------------------------------");
 
         let mut entry = match entry {
@@ -385,10 +437,22 @@ pub fn get_entry_new<R: Read>(
         etrace!("entry_size: {entry_size}");
 
         // An external ref, i.e. a SHA256 hash
+        //
+        // TODO: This is really ugly way to handle things. Need to find a better alt
         let tar_entry = if entry_size > INLINE_CONTENT_MAX {
-            parse_external_entry(&mut entry)?
+            let (tar_entry, padding) = parse_external_entry(&mut entry)?;
+
+            splitstream_reader.skip_padding = Some(padding);
+
+            tar_entry
         } else {
-            parse_internal_entry(&mut entry)?
+            let (tar_entry, bytes_read) = parse_internal_entry(&mut entry)?;
+
+            if bytes_read & 511 != 0 {
+                splitstream_reader.discard_padding(512 - bytes_read)?;
+            }
+
+            tar_entry
         };
 
         etrace!(
@@ -400,10 +464,10 @@ pub fn get_entry_new<R: Read>(
             }
         );
 
-        // process_entry(filesystem, tar_entry)?;
+        return Ok(Some(tar_entry));
     }
 
-    Ok(())
+    Ok(None)
 }
 
 pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<TarEntry>> {
@@ -464,8 +528,11 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                 EntryType::XHeader => {
                     for item in PaxExtensions::new(&content) {
                         let extension = item?;
+
                         let key = extension.key()?;
                         let value = Box::from(extension.value_bytes());
+
+                        etrace!("found XHeader: key: {key}, value: {value:?}");
 
                         if key == "path" {
                             pax_longname = Some(value);
@@ -503,7 +570,11 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
                     let Some(link_name) = header.link_name_bytes() else {
                         bail!("symlink without a name?")
                     };
-                    symlink_target_from_tar(pax_longlink, gnu_longlink, &link_name)
+
+                    let lname = symlink_target_from_tar(pax_longlink, gnu_longlink, &link_name);
+                    etrace!("lname = {:#?}", lname);
+
+                    lname
                 })),
 
                 EntryType::Block => TarItem::Leaf(LeafContent::BlockDevice(
@@ -527,8 +598,14 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
             },
         };
 
+        let p = path_from_tar(pax_longname, gnu_longname, &header.path_bytes());
+
+        if p.as_str().unwrap().contains("ca-certificates") {
+            etrace!("ca-certificates path: {p:#?}");
+        }
+
         return Ok(Some(TarEntry {
-            path: path_from_tar(pax_longname, gnu_longname, &header.path_bytes()),
+            path: p,
             stat: Stat {
                 st_uid: header.uid()? as u32,
                 st_gid: header.gid()? as u32,

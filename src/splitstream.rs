@@ -5,7 +5,7 @@
 
 use std::{
     fmt::Debug,
-    io::{BufReader, Read, Seek, Write},
+    io::{BufReader, Read, Write},
 };
 
 use anyhow::{bail, Result};
@@ -13,7 +13,6 @@ use sha2::{Digest, Sha256};
 use zstd::stream::{read::Decoder, write::Encoder};
 
 use crate::{
-    etrace,
     fsverity::{FsVerityHashValue, Sha256HashValue},
     repository::Repository,
     util::read_exactish,
@@ -298,7 +297,6 @@ impl<R: Read> SplitStreamReader<R> {
                 }
 
                 Some(size) => {
-                    etrace!("inline_bytes was 0, setting it to: {}", size);
                     self.inline_bytes = size;
                 }
             }
@@ -308,7 +306,6 @@ impl<R: Read> SplitStreamReader<R> {
             bail!("Unexpectedly small inline content when parsing splitstream");
         }
 
-        etrace!("Inline bytes > 0 ({}) so returning that", self.inline_bytes);
         Ok(ChunkType::Inline)
     }
 
@@ -324,7 +321,7 @@ impl<R: Read> SplitStreamReader<R> {
         }
     }
 
-    fn discard_padding(&mut self, size: usize) -> Result<()> {
+    pub fn discard_padding(&mut self, size: usize) -> Result<()> {
         let mut buf = [0u8; 512];
         assert!(size <= 512);
         self.ensure_chunk(false, false, size)?;
@@ -414,16 +411,9 @@ impl<R: Read> SplitStreamReader<R> {
     }
 }
 
-
-impl<F: Read> Seek for SplitStreamReader<F> {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        todo!()
-    }
-}
-
 impl<F: Read> Read for SplitStreamReader<F> {
     fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        etrace!("--- Req to req {} bytes", data.len());
+        // etrace!("--- Req to req {} bytes", data.len());
 
         // if we're extracting tar, we are okay with an external chunk
         let ret = match self.ensure_chunk(true, self.tar_extract, 1) {
@@ -431,7 +421,7 @@ impl<F: Read> Read for SplitStreamReader<F> {
 
             Ok(ChunkType::Inline) => {
                 if let Some(padding) = self.skip_padding {
-                    etrace!("Skipping padding: {padding} bytes");
+                    // etrace!("Skipping padding: {padding} bytes");
                     self.discard_padding(padding);
                     self.skip_padding = None;
                 }
@@ -439,7 +429,10 @@ impl<F: Read> Read for SplitStreamReader<F> {
                 let n_bytes = std::cmp::min(data.len(), self.inline_bytes);
                 self.decoder.read_exact(&mut data[0..n_bytes])?;
                 self.inline_bytes -= n_bytes;
-                etrace!("Read {n_bytes} from inline_bytes now value is: {}", self.inline_bytes);
+
+                // etrace!("Read {n_bytes} from inline_bytes now value is: {}", self.inline_bytes);
+                // etrace!("{:?}", data);
+
                 Ok(n_bytes)
             }
 
@@ -451,13 +444,13 @@ impl<F: Read> Read for SplitStreamReader<F> {
                 if data.len() > id.len() {
                     // We just read an external chunk, we shouldn't have any pending inline chunks
                     // left to read
-                    etrace!(
-                        "data.len(): {}, id.len(): {}. Setting Padding to: {}, for external chunk {}",
-                        data.len(),
-                        id.len(),
-                        data.len() - id.len(),
-                        hex::encode(id)
-                    );
+                    // etrace!(
+                    //     "data.len(): {}, id.len(): {}. Setting Padding to: {}, for external chunk {}",
+                    //     data.len(),
+                    //     id.len(),
+                    //     data.len() - id.len(),
+                    //     hex::encode(id)
+                    // );
 
                     self.skip_padding = Some(data.len() - id.len());
                 }
@@ -471,7 +464,7 @@ impl<F: Read> Read for SplitStreamReader<F> {
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
         };
 
-        etrace!("Returned: {ret:?}\n");
+        // etrace!("Returned: {ret:?}\n");
 
         return ret;
     }

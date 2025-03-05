@@ -43,7 +43,11 @@ pub fn process_entry(filesystem: &mut FileSystem, entry: oci::tar::TarEntry) -> 
         }
     } else {
         match entry.item {
-            oci::tar::TarItem::Directory => dir.mkdir(filename, entry.stat),
+            oci::tar::TarItem::Directory => {
+                etrace!("got dir, filename: {filename:#?}");
+
+                dir.mkdir(filename, entry.stat)
+            }
 
             oci::tar::TarItem::Leaf(content) => dir.insert(
                 filename,
@@ -114,10 +118,10 @@ pub fn create_image(
                 process_entry(&mut filesystem, entry)?;
             }
         } else {
-            oci::tar::get_entry_new(&mut layer_stream, &mut filesystem)?;
+            while let Some(entry) = oci::tar::get_entry_new(&mut layer_stream)? {
+                process_entry(&mut filesystem, entry)?;
+            }
         }
-
-        exit(0)
     }
 
     selabel(&mut filesystem, repo)?;
@@ -181,6 +185,7 @@ fn test_process_entry() -> Result<()> {
 
     // both with and without leading slash should be supported
     process_entry(&mut fs, dir_entry("/a"))?;
+    process_entry(&mut fs, dir_entry("/z/"))?;
     process_entry(&mut fs, dir_entry("b"))?;
     process_entry(&mut fs, dir_entry("c"))?;
     assert_files(&fs, &["/", "/a", "/b", "/c"])?;
@@ -195,7 +200,7 @@ fn test_process_entry() -> Result<()> {
     assert_files(
         &fs,
         &[
-            "/", "/a", "/a/b", "/a/c", "/b", "/b/a", "/b/c", "/c", "/c/a", "/c/c",
+            "/", "/a", "/a/b", "/a/c", "/b", "/b/a", "/b/c", "/c", "/c/a", "/c/c", "/z",
         ],
     )?;
 
