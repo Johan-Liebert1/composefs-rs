@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::{
     dumpfile,
     image::{LeafContent, Stat},
-    splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
+    splitstream::{EnsureObjectMessages, SplitStreamData, SplitStreamReader, SplitStreamWriter},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
 };
@@ -96,6 +96,13 @@ pub async fn split_async(
             writer.write_inline(&buffer);
         }
     }
+
+    writer
+        .object_sender
+        .send(EnsureObjectMessages::Finish(std::mem::take(
+            &mut writer.inline_content.lock().unwrap(),
+        )))?;
+
     Ok(())
 }
 

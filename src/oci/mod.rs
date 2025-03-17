@@ -1,7 +1,7 @@
 pub mod image;
 pub mod tar;
 
-use std::{collections::HashMap, io::Read, iter::zip, path::Path};
+use std::{collections::HashMap, io::Read, iter::zip, path::Path, sync::mpsc::Sender};
 
 use anyhow::{bail, ensure, Context, Result};
 use async_compression::tokio::bufread::GzipDecoder;
@@ -15,7 +15,7 @@ use crate::{
     fsverity::Sha256HashValue,
     oci::tar::{get_entry, split_async},
     repository::Repository,
-    splitstream::DigestMap,
+    splitstream::{DigestMap, EnsureObjectMessages},
     util::parse_sha256,
 };
 
@@ -61,6 +61,12 @@ fn sha256_from_digest(digest: &str) -> Result<Sha256HashValue> {
 
 type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
 
+// fn foo<T: Send>(x: T) {}
+//
+// fn bar(i: ImageOp) {
+//     foo(i);
+// }
+
 impl<'repo> ImageOp<'repo> {
     async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
         let config = ImageProxyConfig {
@@ -82,6 +88,7 @@ impl<'repo> ImageOp<'repo> {
         &self,
         layer_sha256: &Sha256HashValue,
         descriptor: &Descriptor,
+        done_chan_sender: Sender<(Sha256HashValue, Sha256HashValue)>,
     ) -> Result<Sha256HashValue> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
@@ -102,11 +109,16 @@ impl<'repo> ImageOp<'repo> {
             self.progress
                 .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
             let decoder = GzipDecoder::new(progress);
-            let mut splitstream = self.repo.create_stream(Some(*layer_sha256), None);
+            let mut splitstream =
+                self.repo
+                    .create_stream(Some(*layer_sha256), None, done_chan_sender);
             split_async(decoder, &mut splitstream).await?;
-            let layer_id = self.repo.write_stream(splitstream, None)?;
+
+            // let layer_id = self.repo.write_stream(splitstream, None)?;
+
             driver.await?;
-            Ok(layer_id)
+            // Ok(layer_id)
+            Ok([0; 32])
         }
     }
 
@@ -133,20 +145,60 @@ impl<'repo> ImageOp<'repo> {
             let config = ImageConfiguration::from_reader(raw_config.as_slice())?;
 
             let mut config_maps = DigestMap::new();
+
+            // (layer_sha256, layer_id)
+            let (done_chan_send, done_chan_recv) =
+                std::sync::mpsc::channel::<(Sha256HashValue, Sha256HashValue)>();
+
             for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
                 let layer_sha256 = sha256_from_digest(cld)?;
-                let layer_id = self
-                    .ensure_layer(&layer_sha256, mld)
+                self.ensure_layer(&layer_sha256, mld, done_chan_send.clone())
                     .await
                     .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+            }
+
+            drop(done_chan_send);
+
+            while let Ok((layer_sha256, layer_id)) = done_chan_recv.recv() {
+                println!(
+                    "layerSha256: {:?}, layerId: {:?}",
+                    hex::encode(layer_sha256),
+                    hex::encode(layer_id)
+                );
+
                 config_maps.insert(&layer_sha256, &layer_id);
             }
 
-            let mut splitstream = self
-                .repo
-                .create_stream(Some(config_sha256), Some(config_maps));
+            let (done_chan_send, done_chan_recv) =
+                std::sync::mpsc::channel::<(Sha256HashValue, Sha256HashValue)>();
+
+            // TODO:
+            // This is only the config and metadata written
+            // A single file at most, doesn't need to be in a separate thread
+            let mut splitstream =
+                self.repo
+                    .create_stream(Some(config_sha256), Some(config_maps), done_chan_send);
             splitstream.write_inline(&raw_config);
-            let config_id = self.repo.write_stream(splitstream, None)?;
+            splitstream
+                .object_sender
+                .send(EnsureObjectMessages::Finish(std::mem::take(
+                    &mut splitstream.inline_content.lock().unwrap(),
+                )))?;
+
+            // let config_id = self.repo.write_stream(splitstream, None)?;
+
+            let mut config_id = [0u8; 32];
+
+            while let Ok((layer_sha256, layer_id)) = done_chan_recv.recv() {
+                println!(
+                    "layerSha256: {:?}, layerId: {:?}",
+                    hex::encode(layer_sha256),
+                    hex::encode(layer_id)
+                );
+
+                config_id = layer_id;
+                break;
+            }
 
             Ok((config_sha256, config_id))
         }
@@ -243,7 +295,7 @@ pub fn write_config(
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
-    let mut stream = repo.create_stream(Some(sha256), Some(refs));
+    let mut stream = repo.create_stream(Some(sha256), Some(refs), todo!());
     stream.write_inline(json_bytes);
     let id = repo.write_stream(stream, None)?;
     Ok((sha256, id))

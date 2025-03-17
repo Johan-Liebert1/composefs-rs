@@ -3,7 +3,12 @@
  * See doc/splitstream.md
  */
 
-use std::io::{BufReader, Read, Write};
+use std::{
+    io::{self, BufReader, Read, Write},
+    process::exit,
+    sync::{mpsc::Sender, Arc, Mutex},
+    thread::{self, JoinHandle},
+};
 
 use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
@@ -11,7 +16,7 @@ use zstd::stream::{read::Decoder, write::Encoder};
 
 use crate::{
     fsverity::{FsVerityHashValue, Sha256HashValue},
-    repository::Repository,
+    repository::{ensure_object_new, Repository},
     util::read_exactish,
 };
 
@@ -58,11 +63,16 @@ impl DigestMap {
     }
 }
 
+/// (ExternalContent, InlineContent)
+pub(crate) type SplitStreamWriterSenderData = (Vec<u8>, Vec<u8>);
+
 pub struct SplitStreamWriter<'a> {
     repo: &'a Repository,
-    inline_content: Vec<u8>,
+    pub(crate) inline_content: Arc<Mutex<Vec<u8>>>,
     writer: Encoder<'a, Vec<u8>>,
-    pub sha256: Option<(Sha256, Sha256HashValue)>,
+    pub(crate) sha256: Option<(Sha256, Sha256HashValue)>,
+    pub(crate) object_sender: Sender<EnsureObjectMessages>,
+    pub join_handle: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for SplitStreamWriter<'_> {
@@ -76,33 +86,182 @@ impl std::fmt::Debug for SplitStreamWriter<'_> {
     }
 }
 
+pub(crate) enum WriterMessages {
+    /// (Digest, InlineData, ExternalData)
+    WriteData((Sha256HashValue, Vec<u8>, Vec<u8>)),
+    Finish(Vec<u8>),
+}
+
+pub(crate) enum EnsureObjectMessages {
+    Data(SplitStreamWriterSenderData),
+    Finish(Vec<u8>),
+}
+
 impl SplitStreamWriter<'_> {
     pub fn new(
         repo: &Repository,
         refs: Option<DigestMap>,
         sha256: Option<Sha256HashValue>,
+        done_chan_sender: Sender<(Sha256HashValue, Sha256HashValue)>,
     ) -> SplitStreamWriter {
-        // SAFETY: we surely can't get an error writing the header to a Vec<u8>
-        let mut writer = Encoder::new(vec![], 0).unwrap();
+        let (object_sender, object_receiver) = std::sync::mpsc::channel::<EnsureObjectMessages>();
+        let (writer_chan_sender, write_chan_receiver) =
+            std::sync::mpsc::channel::<WriterMessages>();
 
-        match refs {
-            Some(DigestMap { map }) => {
-                writer.write_all(&(map.len() as u64).to_le_bytes()).unwrap();
-                for ref entry in map {
-                    writer.write_all(&entry.body).unwrap();
-                    writer.write_all(&entry.verity).unwrap();
+        let inline_content = Arc::new(Mutex::new(vec![]));
+
+        let cloned_sender = object_sender.clone();
+        let repository = repo.repository.clone();
+
+        let handle = thread::spawn({
+            let repository = repo.repository.clone();
+
+            move || {
+                // TODO: Handle error
+                let _ = ensure_object_new(repository, object_receiver, writer_chan_sender);
+            }
+        });
+
+        thread::spawn(move || {
+            // SAFETY: we surely can't get an error writing the header to a Vec<u8>
+            let mut writer = Encoder::new(vec![], 3).unwrap();
+            writer.set_target_cblock_size(Some(1024)).unwrap();
+
+            let mut sha256_builder = sha256.map(|x| (Sha256::new(), x));
+
+            fn flush_inline(
+                writer: &mut impl Write,
+                inline_content: Vec<u8>,
+                sha256_builder: &mut Option<(Sha256, Sha256HashValue)>,
+            ) {
+                if inline_content.is_empty() {
+                    return;
+                }
+
+                if let Some((sha256, ..)) = sha256_builder {
+                    sha256.update(&inline_content);
+                }
+
+                if let Err(e) =
+                    SplitStreamWriter::write_fragment(writer, inline_content.len(), &inline_content)
+                {
+                    println!("write_fragment err while writing inline content: {e:?}")
                 }
             }
-            None => {
-                writer.write_all(&0u64.to_le_bytes()).unwrap();
+
+            match refs {
+                Some(DigestMap { map }) => {
+                    writer.write_all(&(map.len() as u64).to_le_bytes()).unwrap();
+
+                    println!("while writing map.len(): {}", map.len());
+
+                    for ref entry in map {
+                        writer.write_all(&entry.body).unwrap();
+                        writer.write_all(&entry.verity).unwrap();
+                    }
+                }
+
+                None => {
+                    writer.write_all(&0u64.to_le_bytes()).unwrap();
+                }
             }
-        }
+
+            while let Ok(data) = write_chan_receiver.recv() {
+                match data {
+                    WriterMessages::WriteData((recv_data, inline_content, external_content)) => {
+                        flush_inline(&mut writer, inline_content, &mut sha256_builder);
+
+                        if let Some((sha256, ..)) = &mut sha256_builder {
+                            sha256.update(external_content);
+                        }
+
+                        // write the actual data
+                        if let Err(e) =
+                            SplitStreamWriter::write_fragment(&mut writer, 0, &recv_data)
+                        {
+                            println!("write_fragment err while writing external content: {e:?}")
+                        }
+                    }
+
+                    WriterMessages::Finish(inline_content) => {
+                        flush_inline(&mut writer, inline_content, &mut sha256_builder);
+
+                        let finished = writer.finish().unwrap();
+
+                        if let Some((context, expected)) = sha256_builder {
+                            let final_sha = Into::<Sha256HashValue>::into(context.finalize());
+
+                            if final_sha != expected {
+                                println!(
+                                    "\x1b[31m===\nContent doesn't have expected SHA256 hash value!\nExpected: {}, final: {}\n===\n\x1b[0m",
+                                    hex::encode(expected),
+                                    hex::encode(final_sha)
+                                );
+
+                                return;
+                            }
+                        }
+
+                        if let Err(e) =
+                            cloned_sender.send(EnsureObjectMessages::Data((finished, vec![])))
+                        {
+                            println!("Failed to finish writer. Err: {e}");
+                        };
+
+                        break;
+                    }
+                }
+            }
+
+            // wait for the final message
+            // this should also be fine as mpsc::channel messages are always queued in case there
+            // is no receiver receiving yet
+            while let Ok(data) = write_chan_receiver.recv() {
+                match data {
+                    WriterMessages::WriteData((digest, _, _)) => {
+                        // let Some((.., ref sha256)) = sha256_builder else {
+                        //     // bail!("Writer doesn't have sha256 enabled");
+                        //     println!("\x1b[31mWriter doesn't have sha256 enabled\x1b[0m");
+                        //     return;
+                        // };
+
+                        let stream_path = format!(
+                            "streams/{}",
+                            hex::encode(sha256.unwrap_or(/* TODO: Crash here... */ [0; 32]))
+                        );
+
+                        let object_path = Repository::format_object_path(&digest);
+                        Repository::ensure_symlink_new(&stream_path, &object_path, repository);
+
+                        // if let Some(name) = reference {
+                        //     let reference_path = format!("streams/refs/{name}");
+                        //     self.symlink(&reference_path, &stream_path)?;
+                        // }
+
+                        if let Err(e) = done_chan_sender.send((sha256.unwrap_or([0; 32]), digest)) {
+                            println!("Failed to send final digest with err: {e:?}");
+                        }
+
+                        break;
+                    }
+
+                    WriterMessages::Finish(..) => panic!("Received two finish requests"),
+                }
+            }
+
+            drop(cloned_sender);
+            drop(done_chan_sender);
+        });
 
         SplitStreamWriter {
             repo,
-            inline_content: vec![],
-            writer,
+            inline_content,
+            // not used
+            writer: Encoder::new(vec![], 0).unwrap(),
+            object_sender,
+            // not used
             sha256: sha256.map(|x| (Sha256::new(), x)),
+            join_handle: handle,
         }
     }
 
@@ -113,13 +272,11 @@ impl SplitStreamWriter<'_> {
 
     /// flush any buffered inline data, taking new_value as the new value of the buffer
     fn flush_inline(&mut self, new_value: Vec<u8>) -> Result<()> {
-        if !self.inline_content.is_empty() {
-            SplitStreamWriter::write_fragment(
-                &mut self.writer,
-                self.inline_content.len(),
-                &self.inline_content,
-            )?;
-            self.inline_content = new_value;
+        let mut inline = self.inline_content.lock().unwrap();
+
+        if !inline.is_empty() {
+            SplitStreamWriter::write_fragment(&mut self.writer, inline.len(), &inline)?;
+            *inline = new_value;
         }
         Ok(())
     }
@@ -130,7 +287,7 @@ impl SplitStreamWriter<'_> {
         if let Some((ref mut sha256, ..)) = self.sha256 {
             sha256.update(data);
         }
-        self.inline_content.extend(data);
+        self.inline_content.lock().unwrap().extend(data);
     }
 
     /// write a reference to external data to the stream.  If the external data had padding in the
@@ -149,8 +306,25 @@ impl SplitStreamWriter<'_> {
             sha256.update(data);
             sha256.update(&padding);
         }
-        let id = self.repo.ensure_object(data)?;
-        self.write_reference(id, padding)
+
+        let mut mutex_guard = self.inline_content.lock().unwrap();
+        let inline_content = std::mem::replace(&mut *mutex_guard, padding);
+        drop(mutex_guard); // unlock mutex
+
+        // TODO: ack_channel is mpsc so cloning it should be fine
+        if let Err(e) = self
+            .object_sender
+            .send(EnsureObjectMessages::Data((data.to_vec(), inline_content)))
+        {
+            println!("is thread closed: {}", self.join_handle.is_finished());
+            println!("Falied to send message. Err: {e:?}");
+        }
+
+        Ok(())
+
+        // .context("Falied to send data on channel in write_external")?;
+        // let id = self.repo.ensure_object(data)?;
+        // self.write_reference([0; 32], padding)
     }
 
     pub fn done(mut self) -> Result<Sha256HashValue> {

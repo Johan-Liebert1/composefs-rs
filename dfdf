@@ -1,0 +1,46 @@
+Actual
+sha256 4fe48b55ea6acc643fddfd434cf82fd424b79286cd27487d888b75c5a8ebe39c
+verity 934f58367eec4f56eb35a2cae7bf9ec88d4f0d7fbc6bf9a54a646067a855f6f2
+
+layerSha256: "09bc2b0da6ef9328efa819fb9f348cda3e34fc89d96b62c25d6047095d06146b", layerId: "21bc32caf1b92433b18271aa181be7338fbe8924c5b8dc0a18b95caff63f877f"
+layerSha256: "7a03d65da473a13e6470c1e6d8fbc4d3301f5b9c5c846d9817f67d0e580f690d", layerId: "46c24238645471a47ec9b7ccb06b9cfed7e518d606bd22c9c735fa7026ed1350"
+layerSha256: "3debd553f0d6297194cab6a770a75a7a685aae223bbf60ddc4a446cb64980fbe", layerId: "4b3c142d21e066a3460c9f9613c07c4dae1aef702c618b8d312f971de1c52756"
+layerSha256: "54f66ad0959080a961f321b63351b27c36b87e3efce3b25dd24ddb4c900cf2bf", layerId: "ec80283eef91a52d53901e0532a2d058b8cca626f2a40755145d42eb0cc6f6eb"
+layerSha256: "fde51f0a30a53077d5c1e9fe9aac4cc90f42e66da094a9505a4b4846ab3983a7", layerId: "4a0a3da1056b302a6e607a1d67199dedac888a10a158be17955f701a422c7b74"
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+layerSha256: "09bc2b0da6ef9328efa819fb9f348cda3e34fc89d96b62c25d6047095d06146b", layerId: "21bc32caf1b92433b18271aa181be7338fbe8924c5b8dc0a18b95caff63f877f"
+layerSha256: "7a03d65da473a13e6470c1e6d8fbc4d3301f5b9c5c846d9817f67d0e580f690d", layerId: "46c24238645471a47ec9b7ccb06b9cfed7e518d606bd22c9c735fa7026ed1350"
+layerSha256: "3debd553f0d6297194cab6a770a75a7a685aae223bbf60ddc4a446cb64980fbe", layerId: "3021d0b67bc45ad2f907f24e720bcd95577c56a8a0dd34875079935918d07c18"
+layerSha256: "54f66ad0959080a961f321b63351b27c36b87e3efce3b25dd24ddb4c900cf2bf", layerId: "ec80283eef91a52d53901e0532a2d058b8cca626f2a40755145d42eb0cc6f6eb"
+layerSha256: "fde51f0a30a53077d5c1e9fe9aac4cc90f42e66da094a9505a4b4846ab3983a7", layerId: "ef8d93ea47c0f32d325f43c756df0e2cecfc5f911aea03b35bb9c65332a625dc"
+
+
+sha256 4fe48b55ea6acc643fddfd434cf82fd424b79286cd27487d888b75c5a8ebe39c
+verity 7e494f0924cf6016f10f76667a1daf35d10d80ac5b73be57f6e1418e915f80d2
+
+
+Problem
+
+While external entry is being written, a lot of inline content gets added to the inline buffer, and then things are screwed, because we don't know how much 
+was there BEFORE the external entry was sent to be written.
+
+Trial 1
+VecDeque<Vec<u8>>, pass an index of the final VecDeque entry to write. But here let's say external_entry1 sends index 1, and external_entry2 sends index 4
+but external_entry2 finishes before external_entry1, then everything until 4 will be written when 2-4 should've been written.
+
+Trial2
+Send the internal vec on the channel. Have the channel consume it. Should work out
+Can do with std::mem::take / mem::replace
+
+
+Update sha with the external (not digest) data first
+Then update sha with the padding
+Then take the digest of the data and do stuff
+Then flush the inline data first, writing out all the inline data and replacing the inline data with padding
+Then write the digest. Do not add the digest to the writer
+
+
+# multiple workers
+messages are received out of order and produce non deterministic SHA and verity
