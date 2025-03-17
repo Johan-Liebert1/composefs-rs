@@ -16,18 +16,20 @@ anyhow = { version = "1.0.97", default-features = false }
 async-compression = { version = "0.4.22", default-features = false, features = ["tokio", "gzip"] }
 clap = { version = "4.5.32", default-features = false, features = ["std", "help", "usage", "derive"] }
 containers-image-proxy = "0.7.0"
+crossbeam = "0.8.4"
 env_logger = "0.11.7"
 hex = "0.4.3"
 indicatif = { version = "0.17.11", features = ["tokio"] }
 log = "0.4.27"
 oci-spec = "0.7.1"
+rayon = "1.10.0"
 regex-automata = { version = "0.4.9", default-features = false }
 rustix = { version = "1.0.3", features = ["fs", "mount", "process"] }
 sha2 = "0.10.8"
 tar = { version = "0.4.44", default-features = false }
 tempfile = "3.19.1"
 thiserror = "2.0.12"
-tokio = "1.44.1"
+tokio = { version = "1.41.0", features = ["rt-multi-thread"]  }
 xxhash-rust = { version = "0.8.15", features = ["xxh32"] }
 zerocopy = { version = "0.8.24", features = ["derive"] }
 zstd = "0.13.3"

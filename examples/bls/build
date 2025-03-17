@@ -4,46 +4,52 @@ set -eux
 
 cd "${0%/*}"
 
-../common/check-config
+# ../common/check-config
 
 # https://github.com/containers/buildah/issues/5656
-PODMAN_BUILD="podman build --no-cache"
+# PODMAN_BUILD="podman build --no-cache"
 
-cargo build --release
+if [ "${1-}" = "build-bin" ]; then
+    cargo build --release
 
-cp ../../target/release/cfsctl .
-cp ../../target/release/composefs-pivot-sysroot extra/usr/lib/dracut/modules.d/37composefs/
+    cp ../../target/release/cfsctl .
+    cp ../../target/release/composefs-pivot-sysroot extra/usr/lib/dracut/modules.d/37composefs/
+fi
+
 CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
 mkdir -p tmp/sysroot/composefs tmp/sysroot/var
 
-${PODMAN_BUILD} \
-    --iidfile=tmp/base.iid \
-    "$@" \
-    .
+# ${PODMAN_BUILD} \
+#     --iidfile=tmp/base.iid \
+#     "$@" \
+#     .
+# 
+# BASE_ID="$(sed s/sha256:// tmp/base.iid)"
+# podman save --format oci-archive -o tmp/base.tar "${BASE_ID}"
 
-BASE_ID="$(sed s/sha256:// tmp/base.iid)"
-podman save --format oci-archive -o tmp/base.tar "${BASE_ID}"
+BASE_ID="4fe48b55ea6acc643fddfd434cf82fd424b79286cd27487d888b75c5a8ebe39c"
+cp base.tar tmp/base.tar
 ${CFSCTL} oci pull oci-archive:tmp/base.tar
-BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
-fsck.erofs "tmp/sysroot/composefs/images/${BASE_IMAGE_FSVERITY}"
-
-mkdir -p tmp/efi/loader
-echo 'timeout 3' > tmp/efi/loader/loader.conf
-mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
-cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
-cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
-${CFSCTL} oci prepare-boot "${BASE_ID}" tmp/efi
-
-OPTIONS="console=ttyS0,115200 composefs=${BASE_IMAGE_FSVERITY} rw"
-BLE="$(echo tmp/efi/loader/entries/*.conf)"
-test -f "${BLE}"
-if grep '^options ' "${BLE}"; then
-    sed -i "s|^options .*$|\0 ${OPTIONS}|" "${BLE}"
-else
-    echo "options    ${OPTIONS}" >> "${BLE}"
-fi
-sed -i 's@ /boot/@ /@' "${BLE}"
-
-../common/make-image composefs-bls-efi.qcow2
+# BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
+# fsck.erofs "tmp/sysroot/composefs/images/${BASE_IMAGE_FSVERITY}"
+# 
+# mkdir -p tmp/efi/loader
+# echo 'timeout 3' > tmp/efi/loader/loader.conf
+# mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
+# cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
+# cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
+# ${CFSCTL} oci prepare-boot "${BASE_ID}" tmp/efi
+# 
+# OPTIONS="console=ttyS0,115200 composefs=${BASE_IMAGE_FSVERITY} rw"
+# BLE="$(echo tmp/efi/loader/entries/*.conf)"
+# test -f "${BLE}"
+# if grep '^options ' "${BLE}"; then
+#     sed -i "s|^options .*$|\0 ${OPTIONS}|" "${BLE}"
+# else
+#     echo "options    ${OPTIONS}" >> "${BLE}"
+# fi
+# sed -i 's@ /boot/@ /@' "${BLE}"
+# 
+# ../common/make-image composefs-bls-efi.qcow2
