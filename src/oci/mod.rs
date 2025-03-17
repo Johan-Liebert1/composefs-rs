@@ -1,7 +1,7 @@
 pub mod image;
 pub mod tar;
 
-use std::{collections::HashMap, io::Read, iter::zip, path::Path};
+use std::{collections::HashMap, io::Read, iter::zip, marker::PhantomData, path::Path, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
 use async_compression::tokio::bufread::GzipDecoder;
@@ -38,11 +38,12 @@ pub fn ls_layer(repo: &Repository, name: &str) -> Result<()> {
     Ok(())
 }
 
-struct ImageOp<'repo> {
-    repo: &'repo Repository,
-    proxy: ImageProxy,
+struct ImageOp<'repo: 'static> {
+    repo: Arc<Repository>,
+    proxy: Arc<ImageProxy>,
     img: OpenedImage,
     progress: MultiProgress,
+    _x: PhantomData<&'repo ()>,
 }
 
 fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256HashValue> {
@@ -61,13 +62,20 @@ fn sha256_from_digest(digest: &str) -> Result<Sha256HashValue> {
 
 type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
 
+// fn foo<T: Send>(x: T) {}
+//
+// fn bar(i: ImageOp) {
+//     foo(i);
+// }
+
 impl<'repo> ImageOp<'repo> {
-    async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
+    async fn new(repo: Arc<Repository>, imgref: &str) -> Result<Self> {
         let config = ImageProxyConfig {
             // auth_anonymous: true, debug: true, insecure_skip_tls_verification: Some(true),
             ..ImageProxyConfig::default()
         };
         let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
+        let proxy = Arc::new(proxy);
         let img = proxy.open_image(imgref).await.context("Opening image")?;
         let progress = MultiProgress::new();
         Ok(ImageOp {
@@ -75,6 +83,7 @@ impl<'repo> ImageOp<'repo> {
             proxy,
             img,
             progress,
+            _x: PhantomData::default(),
         })
     }
 
@@ -82,31 +91,57 @@ impl<'repo> ImageOp<'repo> {
         &self,
         layer_sha256: &Sha256HashValue,
         descriptor: &Descriptor,
-    ) -> Result<Sha256HashValue> {
+        thandles: &mut Vec<tokio::task::JoinHandle<Result<[u8; 32], anyhow::Error>>>,
+    ) -> Result<()> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
         // fsverity digest for the corresponding splitstream.
+        //
 
         if let Some(layer_id) = self.repo.check_stream(layer_sha256)? {
             self.progress
                 .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
-            Ok(layer_id)
+            Ok(())
         } else {
             // Otherwise, we need to fetch it...
+            //
+            // self.proxy is not Send because driver is not Send
+
             let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
-            let bar = self.progress.add(ProgressBar::new(descriptor.size()));
-            bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
-                .unwrap()
-                .progress_chars("##-"));
-            let progress = bar.wrap_async_read(blob_reader);
-            self.progress
-                .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
-            let decoder = GzipDecoder::new(progress);
-            let mut splitstream = self.repo.create_stream(Some(*layer_sha256), None);
-            split_async(decoder, &mut splitstream).await?;
-            let layer_id = self.repo.write_stream(splitstream, None)?;
-            driver.await?;
-            Ok(layer_id)
+
+            let repo = Arc::clone(&self.repo);
+            let self_progress = self.progress.clone(); // TODO: .clone()
+            let descriptor_size = descriptor.size();
+            let layer_sha256 = *layer_sha256;
+
+            let handle: tokio::task::JoinHandle<Result<[u8; 32], anyhow::Error>> = tokio::spawn(
+                async move {
+                    let bar = self_progress.add(ProgressBar::new(descriptor_size));
+                    bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
+                    .unwrap()
+                    .progress_chars("##-"));
+
+                    let progress = bar.wrap_async_read(blob_reader);
+                    self_progress
+                        .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
+                    let decoder = GzipDecoder::new(progress);
+                    let mut splitstream = repo.create_stream(Some(layer_sha256), None);
+
+                    split_async(decoder, &mut splitstream).await?;
+
+                    let layer_id = repo.write_stream(splitstream, None)?;
+
+                    Ok(layer_id)
+                },
+            );
+
+            thandles.push(handle);
+
+            // TODO: This needs to be awaited
+            // driver.await?;
+
+            // let layer_id = [0u8; 32];
+            Ok(())
         }
     }
 
@@ -115,6 +150,8 @@ impl<'repo> ImageOp<'repo> {
         manifest_layers: &[Descriptor],
         descriptor: &Descriptor,
     ) -> Result<ContentAndVerity> {
+        println!("Called ensure_config");
+
         let config_sha256 = sha256_from_descriptor(descriptor)?;
         if let Some(config_id) = self.repo.check_stream(&config_sha256)? {
             // We already got this config?  Nice.
@@ -133,12 +170,22 @@ impl<'repo> ImageOp<'repo> {
             let config = ImageConfiguration::from_reader(raw_config.as_slice())?;
 
             let mut config_maps = DigestMap::new();
+
+            let mut handles = vec![];
+
             for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
                 let layer_sha256 = sha256_from_digest(cld)?;
-                let layer_id = self
-                    .ensure_layer(&layer_sha256, mld)
+                self.ensure_layer(&layer_sha256, mld, &mut handles)
                     .await
                     .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+            }
+
+            // config_maps.insert(&layer_sha256, &layer_id);
+
+            for (cld, h) in config.rootfs().diff_ids().iter().zip(handles) {
+                let layer_sha256 = sha256_from_digest(cld)?;
+                let layer_id = h.await??;
+
                 config_maps.insert(&layer_sha256, &layer_id);
             }
 
@@ -172,8 +219,10 @@ impl<'repo> ImageOp<'repo> {
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
-pub async fn pull(repo: &Repository, imgref: &str, reference: Option<&str>) -> Result<()> {
-    let op = ImageOp::new(repo, imgref).await?;
+pub async fn pull(repo: Repository, imgref: &str, reference: Option<&str>) -> Result<()> {
+    let repo = Arc::new(repo);
+
+    let op = ImageOp::new(Arc::clone(&repo), imgref).await?;
     let (sha256, id) = op
         .pull()
         .await
