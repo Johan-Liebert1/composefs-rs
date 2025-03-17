@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use rustix::fs::CWD;
 
 use composefs::{oci, repository::Repository, util::parse_sha256};
+use tokio::runtime;
 
 /// cfsctl
 #[derive(Debug, Parser)]
@@ -153,11 +154,13 @@ fn main() -> Result<()> {
                 println!("{}", hex::encode(image_id));
             }
             OciCommand::Pull { ref image, name } => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let runtime = runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
                     .enable_all()
                     .build()
                     .expect("Failed to build tokio runtime");
                 // And invoke the async_main
+                println!("repo: {repo:?}, image: {image:?}, name: {name:?}");
                 runtime.block_on(async move { oci::pull(&repo, image, name.as_deref()).await })?;
             }
             OciCommand::Seal { verity, ref name } => {

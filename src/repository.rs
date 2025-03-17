@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     ffi::CStr,
     fs::File,
-    io::{ErrorKind, Read, Write},
+    io::{self, ErrorKind, Read, Write},
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
@@ -44,6 +44,12 @@ impl Repository {
             "objects",
             OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         )
+    }
+
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            repository: self.repository.try_clone()?,
+        })
     }
 
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Repository> {
@@ -139,8 +145,10 @@ impl Repository {
         &self,
         sha256: Option<Sha256HashValue>,
         maps: Option<DigestMap>,
+        layer_size: u64,
+        done_chan_sender: std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
     ) -> SplitStreamWriter {
-        SplitStreamWriter::new(self, maps, sha256)
+        SplitStreamWriter::new(self, maps, sha256, layer_size, done_chan_sender)
     }
 
     fn parse_object_path(path: impl AsRef<[u8]>) -> Result<Sha256HashValue> {
@@ -163,7 +171,7 @@ impl Repository {
         Ok(result)
     }
 
-    fn format_object_path(id: &Sha256HashValue) -> String {
+    pub fn format_object_path(id: &Sha256HashValue) -> String {
         format!("objects/{:02x}/{}", id[0], hex::encode(&id[1..]))
     }
 
@@ -278,7 +286,7 @@ impl Repository {
         let object_id = match self.has_stream(sha256)? {
             Some(id) => id,
             None => {
-                let mut writer = self.create_stream(Some(*sha256), None);
+                let mut writer = self.create_stream(Some(*sha256), None, todo!(), todo!());
                 callback(&mut writer)?;
                 let object_id = writer.done()?;
 
