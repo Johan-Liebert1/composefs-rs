@@ -9,6 +9,7 @@ use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};
 use sha2::{Digest, Sha256};
+use tokio::task::JoinSet;
 
 use crate::{
     fs::write_to_path,
@@ -91,7 +92,7 @@ impl<'repo> ImageOp<'repo> {
         &self,
         layer_sha256: &Sha256HashValue,
         descriptor: &Descriptor,
-        thandles: &mut Vec<tokio::task::JoinHandle<Result<[u8; 32], anyhow::Error>>>,
+        join_set: &mut JoinSet<Result<[u8; 32], anyhow::Error>>,
     ) -> Result<()> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
@@ -114,7 +115,7 @@ impl<'repo> ImageOp<'repo> {
             let descriptor_size = descriptor.size();
             let layer_sha256 = *layer_sha256;
 
-            let handle: tokio::task::JoinHandle<Result<[u8; 32], anyhow::Error>> = tokio::spawn(
+            join_set.spawn(
                 async move {
                     let bar = self_progress.add(ProgressBar::new(descriptor_size));
                     bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
@@ -135,10 +136,16 @@ impl<'repo> ImageOp<'repo> {
                 },
             );
 
-            thandles.push(handle);
+            // This is useless as it will run the future on the same thread
+            //
+            // let local = tokio::task::LocalSet::new();
+            // local
+            //     .run_until(async move {
+            //     })
+            //     .await;
 
             // TODO: This needs to be awaited
-            // driver.await?;
+            // driver.await;
 
             // let layer_id = [0u8; 32];
             Ok(())
@@ -171,20 +178,21 @@ impl<'repo> ImageOp<'repo> {
 
             let mut config_maps = DigestMap::new();
 
-            let mut handles = vec![];
+            let mut join_set = JoinSet::new();
 
             for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
                 let layer_sha256 = sha256_from_digest(cld)?;
-                self.ensure_layer(&layer_sha256, mld, &mut handles)
-                    .await
-                    .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                self.ensure_layer(&layer_sha256, mld, &mut join_set).await?;
+                // .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
             }
 
             // config_maps.insert(&layer_sha256, &layer_id);
 
-            for (cld, h) in config.rootfs().diff_ids().iter().zip(handles) {
+            let result = join_set.join_all().await;
+
+            for (cld, h) in config.rootfs().diff_ids().iter().zip(result) {
                 let layer_sha256 = sha256_from_digest(cld)?;
-                let layer_id = h.await??;
+                let layer_id = h?;
 
                 config_maps.insert(&layer_sha256, &layer_id);
             }

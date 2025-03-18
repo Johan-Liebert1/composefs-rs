@@ -5,6 +5,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::fd::OwnedFd,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -69,15 +70,28 @@ impl Repository {
     }
 
     pub async fn ensure_object_async(&self, data: &[u8]) -> Result<Sha256HashValue> {
-        let digest = FsVerityHasher::hash(data);
-        let dir = PathBuf::from(format!("objects/{:02x}", digest[0]));
-        let file = dir.join(hex::encode(&digest[1..]));
+        // TODO: This (data.to_vec()) copies the underlying byte slice...
+        //
+        // maybe use Arc<> here?
+        let data: Arc<Vec<u8>> = Arc::from(data.to_vec());
 
         // Check if the object already exists
-        let exists = tokio::task::spawn_blocking({
+        let (exists, digest, dir, file) = tokio::task::spawn_blocking({
             let repository = self.repository.try_clone()?;
-            let file = file.clone();
-            move || accessat(&repository, &file, Access::READ_OK, AtFlags::empty()).is_ok()
+            let data = data.clone();
+
+            move || {
+                let digest = FsVerityHasher::hash(&data);
+                let dir = PathBuf::from(format!("objects/{:02x}", digest[0]));
+                let file = dir.join(hex::encode(&digest[1..]));
+
+                (
+                    accessat(&repository, &file, Access::READ_OK, AtFlags::empty()).is_ok(),
+                    digest,
+                    dir,
+                    file,
+                )
+            }
         })
         .await
         .context("Checking file existence")?;
@@ -89,7 +103,7 @@ impl Repository {
         self.ensure_dir("objects")?;
         self.ensure_dir(&dir)?;
 
-        let fd = tokio::task::spawn_blocking({
+        let w_fd = tokio::task::spawn_blocking({
             let repository = self.repository.try_clone()?;
             let dir = dir.clone();
             move || {
@@ -105,50 +119,63 @@ impl Repository {
         .context("Creating temp file")?;
 
         // write asynchronously
-        tokio::fs::write(proc_self_fd(&fd), data)
-            .await
-            .context("Writing file data")?;
+        // tokio::fs::write(proc_self_fd(&fd), data)
+        //     .await
+        //     .context("Writing file data")?;
 
         // sync file changes to disk
         tokio::task::spawn_blocking({
-            let fd = fd.try_clone()?;
-            move || fdatasync(&fd)
+            let fd = w_fd.try_clone()?;
+
+            // TODO: This copies the underlying byte slice...
+            //
+            // maybe use Arc<> here?
+            let data = data.clone();
+
+            move || {
+                use std::io::Write;
+
+                let mut file = std::fs::File::from(fd);
+                file.write_all(&data)?;
+                file.sync_all()
+            }
         })
         .await?
-        .context("Syncing file")?;
+        .context("Syncing or writing file")?;
 
         // reopen the file in read-only mode for fsverity
+        // let ro_fd = tokio::task::spawn_blocking({
+        //     let fd = fd.try_clone()?;
+        //     move || open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())
+        // })
+        // .await?
+        // .context("Reopening file as read-only")?;
+
         let ro_fd = tokio::task::spawn_blocking({
-            let fd = fd.try_clone()?;
-            move || open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())
+            let digest = digest.clone();
+
+            move || {
+                // prevent cloning fd as that incurs a `dup` syscall
+                let ro_fd = open(proc_self_fd(&w_fd), OFlags::RDONLY, Mode::empty())?;
+
+                // drop the writable fd, else we'll get a resource busy error when we try to enable
+                // verity
+                drop(w_fd);
+
+                fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&ro_fd)?;
+
+                fsverity::ensure_verity(&ro_fd, &digest);
+
+                Ok::<OwnedFd, std::io::Error>(ro_fd)
+            }
         })
         .await?
-        .context("Reopening file as read-only")?;
-
-        // drop the writable fd
-        drop(fd);
-
-        tokio::task::spawn_blocking({
-            let ro_fd = ro_fd.try_clone()?;
-            move || fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&ro_fd)
-        })
-        .await?
-        .context("Re-validating verity digest")?;
+        .context("Enabling verity on file")?;
 
         // double-check verity
-        tokio::task::spawn_blocking({
-            let ro_fd = ro_fd.try_clone()?;
-            let digest = digest.clone();
-            move || fsverity::ensure_verity(&ro_fd, &digest)
-        })
-        .await?
-        .context("Verifying integrity")?;
-
-        // Link the file into the repository
         let link_result = tokio::task::spawn_blocking({
+            // this does incur a dup syscall
             let repository = self.repository.try_clone()?;
-            let file = file.clone();
-            let ro_fd = ro_fd.try_clone()?;
 
             move || {
                 linkat(
@@ -168,7 +195,6 @@ impl Repository {
             }
         }
 
-        drop(ro_fd);
         Ok(digest)
     }
 
