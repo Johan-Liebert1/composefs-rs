@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::{
     dumpfile,
     image::{LeafContent, Stat},
-    splitstream::{SplitStreamData, SplitStreamReader, SplitStreamWriter},
+    splitstream::{EnsureObjectMessages, SplitStreamData, SplitStreamReader, SplitStreamWriter},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
 };
@@ -90,12 +90,19 @@ pub async fn split_async(
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
             // non-empty regular file: store the data in the object store
             let padding = buffer.split_off(actual_size);
-            writer.write_external_async(&buffer, padding).await?;
+            writer.write_external(&buffer, padding)?;
         } else {
             // else: store the data inline in the split stream
             writer.write_inline(&buffer);
         }
     }
+
+    writer
+        .object_sender
+        .send(EnsureObjectMessages::Finish(std::mem::take(
+            &mut writer.inline_content.lock().unwrap(),
+        )))?;
+
     Ok(())
 }
 

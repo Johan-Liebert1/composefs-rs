@@ -1,7 +1,7 @@
 pub mod image;
 pub mod tar;
 
-use std::{collections::HashMap, io::Read, iter::zip, marker::PhantomData, path::Path, sync::Arc};
+use std::{collections::HashMap, io::Read, iter::zip, path::Path, sync::mpsc::Sender};
 
 use anyhow::{bail, ensure, Context, Result};
 use async_compression::tokio::bufread::GzipDecoder;
@@ -9,7 +9,6 @@ use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};
 use sha2::{Digest, Sha256};
-use tokio::task::JoinSet;
 
 use crate::{
     fs::write_to_path,
@@ -39,12 +38,11 @@ pub fn ls_layer(repo: &Repository, name: &str) -> Result<()> {
     Ok(())
 }
 
-struct ImageOp<'repo: 'static> {
-    repo: Arc<Repository>,
-    proxy: Arc<ImageProxy>,
+struct ImageOp<'repo> {
+    repo: &'repo Repository,
+    proxy: ImageProxy,
     img: OpenedImage,
     progress: MultiProgress,
-    _x: PhantomData<&'repo ()>,
 }
 
 fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256HashValue> {
@@ -70,13 +68,12 @@ type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
 // }
 
 impl<'repo> ImageOp<'repo> {
-    async fn new(repo: Arc<Repository>, imgref: &str) -> Result<Self> {
+    async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
         let config = ImageProxyConfig {
             // auth_anonymous: true, debug: true, insecure_skip_tls_verification: Some(true),
             ..ImageProxyConfig::default()
         };
         let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
-        let proxy = Arc::new(proxy);
         let img = proxy.open_image(imgref).await.context("Opening image")?;
         let progress = MultiProgress::new();
         Ok(ImageOp {
@@ -84,7 +81,6 @@ impl<'repo> ImageOp<'repo> {
             proxy,
             img,
             progress,
-            _x: PhantomData::default(),
         })
     }
 
@@ -92,63 +88,37 @@ impl<'repo> ImageOp<'repo> {
         &self,
         layer_sha256: &Sha256HashValue,
         descriptor: &Descriptor,
-        join_set: &mut JoinSet<Result<[u8; 32], anyhow::Error>>,
-    ) -> Result<()> {
+        done_chan_sender: Sender<(Sha256HashValue, Sha256HashValue)>,
+    ) -> Result<Sha256HashValue> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
         // fsverity digest for the corresponding splitstream.
-        //
 
         if let Some(layer_id) = self.repo.check_stream(layer_sha256)? {
             self.progress
                 .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
-            Ok(())
+            Ok(layer_id)
         } else {
             // Otherwise, we need to fetch it...
-            //
-            // self.proxy is not Send because driver is not Send
-
             let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
+            let bar = self.progress.add(ProgressBar::new(descriptor.size()));
+            bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
+                .unwrap()
+                .progress_chars("##-"));
+            let progress = bar.wrap_async_read(blob_reader);
+            self.progress
+                .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
+            let decoder = GzipDecoder::new(progress);
+            let mut splitstream =
+                self.repo
+                    .create_stream(Some(*layer_sha256), None, done_chan_sender);
+            split_async(decoder, &mut splitstream).await?;
 
-            let repo = Arc::clone(&self.repo);
-            let self_progress = self.progress.clone(); // TODO: .clone()
-            let descriptor_size = descriptor.size();
-            let layer_sha256 = *layer_sha256;
+            // let layer_id = self.repo.write_stream(splitstream, None)?;
 
-            join_set.spawn(
-                async move {
-                    let bar = self_progress.add(ProgressBar::new(descriptor_size));
-                    bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
-                    .unwrap()
-                    .progress_chars("##-"));
-
-                    let progress = bar.wrap_async_read(blob_reader);
-                    self_progress
-                        .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
-                    let decoder = GzipDecoder::new(progress);
-                    let mut splitstream = repo.create_stream(Some(layer_sha256), None);
-
-                    split_async(decoder, &mut splitstream).await?;
-
-                    let layer_id = repo.write_stream(splitstream, None)?;
-
-                    Ok(layer_id)
-                },
-            );
-
-            // This is useless as it will run the future on the same thread
-            //
-            // let local = tokio::task::LocalSet::new();
-            // local
-            //     .run_until(async move {
-            //     })
-            //     .await;
-
-            // TODO: This needs to be awaited
-            // driver.await;
-
-            // let layer_id = [0u8; 32];
-            Ok(())
+            driver.await?;
+            // Ok(layer_id)
+            Ok([0; 32])
         }
     }
 
@@ -157,8 +127,6 @@ impl<'repo> ImageOp<'repo> {
         manifest_layers: &[Descriptor],
         descriptor: &Descriptor,
     ) -> Result<ContentAndVerity> {
-        println!("Called ensure_config");
-
         let config_sha256 = sha256_from_descriptor(descriptor)?;
         if let Some(config_id) = self.repo.check_stream(&config_sha256)? {
             // We already got this config?  Nice.
@@ -178,30 +146,48 @@ impl<'repo> ImageOp<'repo> {
 
             let mut config_maps = DigestMap::new();
 
-            let mut join_set = JoinSet::new();
+            // (layer_sha256, layer_id)
+            let (done_chan_send, done_chan_recv) =
+                std::sync::mpsc::channel::<(Sha256HashValue, Sha256HashValue)>();
 
             for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
                 let layer_sha256 = sha256_from_digest(cld)?;
-                self.ensure_layer(&layer_sha256, mld, &mut join_set).await?;
-                // .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                self.ensure_layer(&layer_sha256, mld, done_chan_send.clone())
+                    .await
+                    .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
             }
 
-            // config_maps.insert(&layer_sha256, &layer_id);
+            drop(done_chan_send);
 
-            let result = join_set.join_all().await;
-
-            for (cld, h) in config.rootfs().diff_ids().iter().zip(result) {
-                let layer_sha256 = sha256_from_digest(cld)?;
-                let layer_id = h?;
+            while let Ok((layer_sha256, layer_id)) = done_chan_recv.recv() {
+                println!(
+                    "layerSha256: {:?}, layerId: {:?}",
+                    hex::encode(layer_sha256),
+                    hex::encode(layer_id)
+                );
 
                 config_maps.insert(&layer_sha256, &layer_id);
             }
 
-            let mut splitstream = self
-                .repo
-                .create_stream(Some(config_sha256), Some(config_maps));
+            let (done_chan_send, done_chan_recv) =
+                std::sync::mpsc::channel::<(Sha256HashValue, Sha256HashValue)>();
+
+            // TODO:
+            // This is only the config and metadata written
+            // A single file at most, doesn't need to be in a separate thread
+            let mut splitstream =
+                self.repo
+                    .create_stream(Some(config_sha256), Some(config_maps), done_chan_send);
             splitstream.write_inline(&raw_config);
             let config_id = self.repo.write_stream(splitstream, None)?;
+
+            // while let Ok((layer_sha256, layer_id)) = done_chan_recv.recv() {
+            //     println!(
+            //         "layerSha256: {:?}, layerId: {:?}",
+            //         hex::encode(layer_sha256),
+            //         hex::encode(layer_id)
+            //     );
+            // }
 
             Ok((config_sha256, config_id))
         }
@@ -227,10 +213,8 @@ impl<'repo> ImageOp<'repo> {
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
-pub async fn pull(repo: Repository, imgref: &str, reference: Option<&str>) -> Result<()> {
-    let repo = Arc::new(repo);
-
-    let op = ImageOp::new(Arc::clone(&repo), imgref).await?;
+pub async fn pull(repo: &Repository, imgref: &str, reference: Option<&str>) -> Result<()> {
+    let op = ImageOp::new(repo, imgref).await?;
     let (sha256, id) = op
         .pull()
         .await
@@ -300,7 +284,7 @@ pub fn write_config(
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
-    let mut stream = repo.create_stream(Some(sha256), Some(refs));
+    let mut stream = repo.create_stream(Some(sha256), Some(refs), todo!());
     stream.write_inline(json_bytes);
     let id = repo.write_stream(stream, None)?;
     Ok((sha256, id))
