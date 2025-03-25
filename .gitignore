@@ -2,3 +2,4 @@
 /target
 *.tar
 *.qcow2
+src/bin/testing.rs

@@ -109,9 +109,12 @@ impl<'repo> ImageOp<'repo> {
             self.progress
                 .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
             let decoder = GzipDecoder::new(progress);
-            let mut splitstream =
-                self.repo
-                    .create_stream(Some(*layer_sha256), None, done_chan_sender);
+            let mut splitstream = self.repo.create_stream(
+                Some(*layer_sha256),
+                None,
+                descriptor.size(),
+                done_chan_sender,
+            );
             split_async(decoder, &mut splitstream).await?;
 
             // let layer_id = self.repo.write_stream(splitstream, None)?;
@@ -152,6 +155,7 @@ impl<'repo> ImageOp<'repo> {
 
             for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
                 let layer_sha256 = sha256_from_digest(cld)?;
+
                 self.ensure_layer(&layer_sha256, mld, done_chan_send.clone())
                     .await
                     .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
@@ -177,12 +181,13 @@ impl<'repo> ImageOp<'repo> {
             // A single file at most, doesn't need to be in a separate thread
             let mut splitstream =
                 self.repo
-                    .create_stream(Some(config_sha256), Some(config_maps), done_chan_send);
+                    .create_stream(Some(config_sha256), Some(config_maps), 1, done_chan_send);
             splitstream.write_inline(&raw_config);
             splitstream
                 .object_sender
-                .send(EnsureObjectMessages::Finish(std::mem::take(
-                    &mut splitstream.inline_content.lock().unwrap(),
+                .send(EnsureObjectMessages::Finish((
+                    std::mem::take(&mut splitstream.inline_content),
+                    0,
                 )))?;
 
             // let config_id = self.repo.write_stream(splitstream, None)?;
@@ -295,7 +300,7 @@ pub fn write_config(
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
-    let mut stream = repo.create_stream(Some(sha256), Some(refs), todo!());
+    let mut stream = repo.create_stream(Some(sha256), Some(refs), todo!(), todo!());
     stream.write_inline(json_bytes);
     let id = repo.write_stream(stream, None)?;
     Ok((sha256, id))

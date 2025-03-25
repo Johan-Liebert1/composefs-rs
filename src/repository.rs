@@ -5,11 +5,10 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::fd::OwnedFd,
     path::{Path, PathBuf},
-    sync::{
-        mpsc::{Receiver, Sender},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
 };
+
+use crossbeam::channel::{Receiver, Sender};
 
 use anyhow::{bail, ensure, Context, Result};
 use rustix::{
@@ -35,71 +34,88 @@ use crate::{
 
 #[derive(Debug)]
 pub struct Repository {
-    pub repository: Arc<Mutex<OwnedFd>>,
+    pub repository: OwnedFd,
     path: PathBuf,
 }
 
 impl Drop for Repository {
     fn drop(&mut self) {
-        let rep = self.repository.lock().unwrap();
-        flock(&*rep, FlockOperation::Unlock).expect("repository unlock failed");
+        // let rep = self.repository.lock().unwrap();
+        flock(&self.repository, FlockOperation::Unlock).expect("repository unlock failed");
     }
 }
 
-pub fn ensure_dir(repository: Arc<Mutex<OwnedFd>>, dir: impl AsRef<Path>) -> ErrnoResult<()> {
-    mkdirat(&*repository.lock().unwrap(), dir.as_ref(), 0o755.into()).or_else(|e| match e {
+pub fn ensure_dir(repository: &OwnedFd, dir: impl AsRef<Path>) -> ErrnoResult<()> {
+    mkdirat(repository, dir.as_ref(), 0o755.into()).or_else(|e| match e {
         Errno::EXIST => Ok(()),
         _ => Err(e),
     })
 }
 
 pub(crate) fn ensure_object_new(
-    repository: Arc<Mutex<OwnedFd>>,
+    repository: OwnedFd,
     data_recv_channel: Receiver<EnsureObjectMessages>,
     result_send_channel: Sender<WriterMessages>,
+    sha: String,
 ) -> Result<()> /* TODO: Don't need to return result here */ {
     while let Ok(data) = data_recv_channel.recv() {
         match data {
-            EnsureObjectMessages::Data((data, inline_content)) => {
+            EnsureObjectMessages::Data((data, inline_content, seq_num)) => {
                 let digest = FsVerityHasher::hash(&data);
                 let dir = PathBuf::from(format!("objects/{:02x}", digest[0]));
                 let file = dir.join(hex::encode(&digest[1..]));
 
-                let repository = repository.lock().unwrap();
+                // let repository = repository.lock().unwrap();
 
                 // fairly common...
-                if accessat(&*repository, &file, Access::READ_OK, AtFlags::empty()) == Ok(()) {
+                if accessat(&repository, &file, Access::READ_OK, AtFlags::empty()) == Ok(()) {
                     if let Err(e) = result_send_channel.send(WriterMessages::WriteData((
                         digest,
                         inline_content,
                         data,
+                        seq_num,
                     ))) {
-                        println!("Failed to ack message. Err: {}", e.to_string());
+                        println!(
+                            "Failed to ack message for layer {sha}. Err: {}",
+                            e.to_string()
+                        );
                     };
 
                     continue;
                 }
 
                 // ensure_dir("objects")?;
-                mkdirat(&*repository, "objects", 0o755.into()).or_else(|e| match e {
+                mkdirat(&repository, "objects", 0o755.into()).or_else(|e| match e {
                     Errno::EXIST => Ok(()),
                     _ => Err(e),
                 })?;
 
                 // ensure_dir(&dir)?;
-                mkdirat(&*repository, &dir, 0o755.into()).or_else(|e| match e {
+                mkdirat(&repository, &dir, 0o755.into()).or_else(|e| match e {
                     Errno::EXIST => Ok(()),
                     _ => Err(e),
                 })?;
 
                 let fd = openat(
-                    &*repository,
+                    &repository,
                     &dir,
                     OFlags::RDWR | OFlags::CLOEXEC | OFlags::TMPFILE,
                     0o666.into(),
                 )?;
                 rustix::io::write(&fd, &data)?; // TODO: no write_all() here...
                 fdatasync(&fd)?;
+
+                if let Err(e) = result_send_channel.send(WriterMessages::WriteData((
+                    digest,
+                    inline_content,
+                    data,
+                    seq_num,
+                ))) {
+                    println!(
+                        "Failed to ack message at the end for layer {sha}. Err: {}",
+                        e.to_string()
+                    );
+                };
 
                 // We can't enable verity with an open writable fd, so re-open and close the old one.
                 let ro_fd = open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())?;
@@ -114,7 +130,7 @@ pub(crate) fn ensure_object_new(
                 if let Err(err) = linkat(
                     CWD,
                     proc_self_fd(&ro_fd),
-                    &*repository,
+                    &repository,
                     file,
                     AtFlags::SYMLINK_FOLLOW,
                 ) {
@@ -124,18 +140,10 @@ pub(crate) fn ensure_object_new(
                 }
 
                 drop(ro_fd);
-
-                if let Err(e) = result_send_channel.send(WriterMessages::WriteData((
-                    digest,
-                    inline_content,
-                    data,
-                ))) {
-                    println!("Failed to ack message at the end. Err: {}", e.to_string());
-                };
             }
 
-            EnsureObjectMessages::Finish(inline_content) => {
-                result_send_channel.send(WriterMessages::Finish(inline_content))?
+            EnsureObjectMessages::Finish(final_msg) => {
+                result_send_channel.send(WriterMessages::Finish(final_msg))?
             }
         }
     }
@@ -156,10 +164,7 @@ impl Repository {
         flock(&repository, FlockOperation::LockShared)
             .with_context(|| format!("Cannot lock repository {path:?}"))?;
 
-        Ok(Repository {
-            repository: Arc::new(Mutex::new(repository)),
-            path,
-        })
+        Ok(Repository { repository, path })
     }
 
     pub fn open_user() -> Result<Repository> {
@@ -173,9 +178,9 @@ impl Repository {
     }
 
     fn ensure_dir(&self, dir: impl AsRef<Path>) -> ErrnoResult<()> {
-        let rep = self.repository.lock().unwrap();
+        let rep = &self.repository; // .lock().unwrap();
 
-        mkdirat(&*rep, dir.as_ref(), 0o755.into()).or_else(|e| match e {
+        mkdirat(rep, dir.as_ref(), 0o755.into()).or_else(|e| match e {
             Errno::EXIST => Ok(()),
             _ => Err(e),
         })
@@ -186,10 +191,10 @@ impl Repository {
         let dir = PathBuf::from(format!("objects/{:02x}", digest[0]));
         let file = dir.join(hex::encode(&digest[1..]));
 
-        let rep = self.repository.lock().unwrap();
+        let rep = &self.repository; // .lock().unwrap();
 
         // fairly common...
-        if accessat(&*rep, &file, Access::READ_OK, AtFlags::empty()) == Ok(()) {
+        if accessat(rep, &file, Access::READ_OK, AtFlags::empty()) == Ok(()) {
             return Ok(digest);
         }
 
@@ -257,9 +262,10 @@ impl Repository {
         &self,
         sha256: Option<Sha256HashValue>,
         maps: Option<DigestMap>,
-        done_chan_sender: Sender<(Sha256HashValue, Sha256HashValue)>,
+        layer_size: u64,
+        done_chan_sender: std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
     ) -> SplitStreamWriter {
-        SplitStreamWriter::new(self, maps, sha256, done_chan_sender)
+        SplitStreamWriter::new(self, maps, sha256, layer_size, done_chan_sender)
     }
 
     fn parse_object_path(path: impl AsRef<[u8]>) -> Result<Sha256HashValue> {
@@ -289,9 +295,9 @@ impl Repository {
     pub fn has_stream(&self, sha256: &Sha256HashValue) -> Result<Option<Sha256HashValue>> {
         let stream_path = format!("streams/{}", hex::encode(sha256));
 
-        let rep = self.repository.lock().unwrap();
+        let rep = &self.repository; // .lock().unwrap();
 
-        match readlinkat(&*rep, &stream_path, []) {
+        match readlinkat(rep, &stream_path, []) {
             Ok(target) => {
                 // NB: This is kinda unsafe: we depend that the symlink didn't get corrupted
                 // we could also measure the verity of the destination object, but it doesn't
@@ -399,7 +405,7 @@ impl Repository {
         let object_id = match self.has_stream(sha256)? {
             Some(id) => id,
             None => {
-                let mut writer = self.create_stream(Some(*sha256), None, todo!());
+                let mut writer = self.create_stream(Some(*sha256), None, todo!(), todo!());
                 callback(&mut writer)?;
                 let object_id = writer.done()?;
 
@@ -503,7 +509,7 @@ impl Repository {
     pub fn symlink_new(
         name: impl AsRef<Path>,
         target: impl AsRef<Path>,
-        repository: Arc<Mutex<OwnedFd>>,
+        repository: OwnedFd,
     ) -> ErrnoResult<()> {
         let name = name.as_ref();
 
@@ -523,7 +529,7 @@ impl Repository {
         // and create those ancestors as we do so
         for symlink_component in symlink_components {
             symlink_ancestor.push(symlink_component);
-            ensure_dir(Arc::clone(&repository), &symlink_ancestor)?;
+            ensure_dir(&repository, &symlink_ancestor)?;
             relative.push("..");
         }
 
@@ -532,8 +538,8 @@ impl Repository {
             relative.push(target_component);
         }
 
-        let rep = repository.lock().unwrap();
-        symlinkat(relative, &*rep, name)
+        // let rep = repository.lock().unwrap();
+        symlinkat(relative, &repository, name)
     }
 
     pub fn symlink(&self, name: impl AsRef<Path>, target: impl AsRef<Path>) -> ErrnoResult<()> {
@@ -564,14 +570,14 @@ impl Repository {
             relative.push(target_component);
         }
 
-        let rep = self.repository.lock().unwrap();
-        symlinkat(relative, &*rep, name)
+        // let rep = self.repository.lock().unwrap();
+        symlinkat(relative, &self.repository, name)
     }
 
     pub fn ensure_symlink_new<P: AsRef<Path>>(
         name: P,
         target: &str,
-        repository: Arc<Mutex<OwnedFd>>,
+        repository: OwnedFd,
     ) -> ErrnoResult<()> {
         Repository::symlink_new(name, target, repository).or_else(|e| match e {
             Errno::EXIST => Ok(()),
@@ -628,8 +634,8 @@ impl Repository {
 
     fn openat(&self, name: &str, flags: OFlags) -> ErrnoResult<OwnedFd> {
         // Unconditionally add CLOEXEC as we always want it.
-        let rep = self.repository.lock().unwrap();
-        openat(&*rep, name, flags | OFlags::CLOEXEC, Mode::empty())
+        // let rep = self.repository.lock().unwrap();
+        openat(&self.repository, name, flags | OFlags::CLOEXEC, Mode::empty())
     }
 
     fn gc_category(&self, category: &str) -> Result<HashSet<Sha256HashValue>> {
@@ -672,8 +678,8 @@ impl Repository {
     }
 
     pub fn gc(&self) -> Result<()> {
-        let rep = self.repository.lock().unwrap();
-        flock(&*rep, FlockOperation::LockExclusive)?;
+        // let rep = self.repository.lock().unwrap();
+        flock(&self.repository, FlockOperation::LockExclusive)?;
 
         let mut objects = HashSet::new();
 
@@ -719,9 +725,9 @@ impl Repository {
             }
         }
 
-        let rep = self.repository.lock().unwrap();
+        // let rep = self.repository.lock().unwrap();
 
-        Ok(flock(&*rep, FlockOperation::LockShared)?) // XXX: finally { } ?
+        Ok(flock(&self.repository, FlockOperation::LockShared)?) // XXX: finally { } ?
     }
 
     pub fn fsck(&self) -> Result<()> {
