@@ -15,7 +15,7 @@ use crate::{
     fsverity::Sha256HashValue,
     oci::tar::{get_entry, split_async},
     repository::Repository,
-    splitstream::{DigestMap, EnsureObjectMessages},
+    splitstream::{DigestMap, EnsureObjectMessages, FinishMessage},
     util::parse_sha256,
 };
 
@@ -185,12 +185,10 @@ impl<'repo> ImageOp<'repo> {
             splitstream.write_inline(&raw_config);
             splitstream
                 .object_sender
-                .send(EnsureObjectMessages::Finish((
-                    std::mem::take(&mut splitstream.inline_content),
-                    0,
-                )))?;
-
-            // let config_id = self.repo.write_stream(splitstream, None)?;
+                .send(EnsureObjectMessages::Finish(FinishMessage {
+                    data: std::mem::take(&mut splitstream.inline_content),
+                    total_msgs: 0,
+                }))?;
 
             let mut config_id = [0u8; 32];
 

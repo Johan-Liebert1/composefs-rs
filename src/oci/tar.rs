@@ -16,7 +16,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::{
     dumpfile,
     image::{LeafContent, Stat},
-    splitstream::{EnsureObjectMessages, SplitStreamData, SplitStreamReader, SplitStreamWriter},
+    splitstream::{
+        EnsureObjectMessages, FinishMessage, SplitStreamData, SplitStreamReader, SplitStreamWriter,
+    },
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
 };
@@ -100,12 +102,12 @@ pub async fn split_async(
         }
     }
 
-    println!("Final seq_num: {seq_num}");
-
-    writer.object_sender.send(EnsureObjectMessages::Finish((
-        std::mem::take(&mut writer.inline_content),
-        seq_num,
-    )))?;
+    writer
+        .object_sender
+        .send(EnsureObjectMessages::Finish(FinishMessage {
+            data: std::mem::take(&mut writer.inline_content),
+            total_msgs: seq_num,
+        }))?;
 
     Ok(())
 }

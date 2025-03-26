@@ -5,7 +5,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::BinaryHeap,
     io::{BufReader, Read, Write},
     thread::{self, JoinHandle},
 };
@@ -84,18 +84,17 @@ impl std::fmt::Debug for SplitStreamWriter<'_> {
     }
 }
 
-pub(crate) type SeqNum = usize;
-pub(crate) type InlineData = Vec<u8>;
-pub(crate) type ExternalData = Vec<u8>;
-/// (Data, Total Messages)
-pub(crate) type FinishMessage = (Vec<u8>, usize);
+pub(crate) struct FinishMessage {
+    pub(crate) data: Vec<u8>,
+    pub(crate) total_msgs: usize,
+}
 
 #[derive(Eq)]
 pub(crate) struct WriterMessagesData {
     digest: Sha256HashValue,
-    inline_content: InlineData,
-    external_data: ExternalData,
-    seq_num: SeqNum,
+    inline_content: Vec<u8>,
+    external_data: Vec<u8>,
+    seq_num: usize,
 }
 
 pub(crate) enum WriterMessages {
@@ -121,7 +120,11 @@ impl Ord for WriterMessagesData {
     }
 }
 
-pub(crate) type SplitStreamWriterSenderData = (ExternalData, InlineData, SeqNum);
+pub(crate) struct SplitStreamWriterSenderData {
+    pub(crate) external_data: Vec<u8>,
+    pub(crate) inline_content: Vec<u8>,
+    pub(crate) seq_num: usize,
+}
 pub(crate) enum EnsureObjectMessages {
     Data(SplitStreamWriterSenderData),
     Finish(FinishMessage),
@@ -163,21 +166,18 @@ impl SplitStreamWriter<'_> {
                     move || {
                         while let Ok(data) = object_receiver.recv() {
                             match data {
-                                EnsureObjectMessages::Data((
-                                    external_data,
-                                    inline_content,
-                                    seq_num,
-                                )) => {
-                                    let digest_result = repository.ensure_object(&external_data);
+                                EnsureObjectMessages::Data(data) => {
+                                    let digest_result = repository.ensure_object(&data.external_data);
 
-                                    if let Err(e) =
-                                        writer_chan_sender.send(WriterMessages::WriteData( WriterMessagesData{
-                                            // TODO: Handle error
-                                            digest: digest_result.unwrap(),
-                                            inline_content,
-                                            external_data,
-                                            seq_num,
-                                        }))
+                                    let msg = WriterMessagesData{
+                                        // TODO: Handle error
+                                        digest: digest_result.unwrap(),
+                                        inline_content:data.inline_content,
+                                        external_data:data.external_data,
+                                        seq_num: data.seq_num
+                                    };
+
+                                    if let Err(e) = writer_chan_sender.send(WriterMessages::WriteData(msg))
                                     {
                                         println!(
                                             "Failed to ack message at the end for layer {sha}. Err: {}",
@@ -270,7 +270,7 @@ impl SplitStreamWriter<'_> {
                 }
 
                 fn handle_final_message(
-                    inline_content: InlineData,
+                    inline_content: Vec<u8>,
                     mut writer: Encoder<'static, Vec<u8>>,
                     mut sha256_builder: Option<(Sha256, Sha256HashValue)>,
                     cloned_sender: &Sender<EnsureObjectMessages>,
@@ -293,9 +293,13 @@ impl SplitStreamWriter<'_> {
                         }
                     }
 
-                    if let Err(e) =
-                        cloned_sender.send(EnsureObjectMessages::Data((finished, vec![], 0)))
-                    {
+                    if let Err(e) = cloned_sender.send(EnsureObjectMessages::Data(
+                        SplitStreamWriterSenderData {
+                            external_data: finished,
+                            inline_content: vec![],
+                            seq_num: 0,
+                        },
+                    )) {
                         println!("Failed to finish writer. Err: {e}");
                     };
                 }
@@ -335,7 +339,7 @@ impl SplitStreamWriter<'_> {
 
                             last = write_message(&mut heap, &mut writer, &mut sha256_builder, last);
 
-                            if let Some((_, total_msgs)) = final_message {
+                            if let Some(FinishMessage { total_msgs, .. }) = final_message {
                                 if last >= total_msgs {
                                     println!(
                                         "Breaking {}. Last: {last}, total_msgs: {total_msgs}",
@@ -361,7 +365,7 @@ impl SplitStreamWriter<'_> {
                                 );
                             }
 
-                            let total_msgs = final_msg.1;
+                            let total_msgs = final_msg.total_msgs;
 
                             final_message = Some(final_msg);
 
@@ -375,7 +379,11 @@ impl SplitStreamWriter<'_> {
                     }
                 }
 
-                if let Some((inline_content, ..)) = final_message {
+                if let Some(FinishMessage {
+                    data: inline_content,
+                    ..
+                }) = final_message
+                {
                     handle_final_message(inline_content, writer, sha256_builder, &cloned_sender);
                 }
 
@@ -454,44 +462,24 @@ impl SplitStreamWriter<'_> {
     /// really, "add inline content to the buffer"
     /// you need to call .flush_inline() later
     pub fn write_inline(&mut self, data: &[u8]) {
-        // if let Some((ref mut sha256, ..)) = self.sha256 {
-        //     sha256.update(data);
-        // }
         self.inline_content.extend(data);
     }
 
-    /// write a reference to external data to the stream.  If the external data had padding in the
-    /// stream which is not stored in the object then pass it here as well and it will be stored
-    /// inline after the reference.
-    fn write_reference(&mut self, reference: Sha256HashValue, padding: Vec<u8>) -> Result<()> {
-        // Flush the inline data before we store the external reference.  Any padding from the
-        // external data becomes the start of a new inline block.
-        self.flush_inline(padding)?;
-
-        SplitStreamWriter::write_fragment(&mut self.writer, 0, &reference)
-    }
-
     pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>, seq_num: usize) -> Result<()> {
-        // if let Some((ref mut sha256, ..)) = self.sha256 {
-        //     sha256.update(data);
-        //     sha256.update(&padding);
-        // }
-
         let inline_content = std::mem::replace(&mut self.inline_content, padding);
 
-        if let Err(e) = self.object_sender.send(EnsureObjectMessages::Data((
-            data.to_vec(),
-            inline_content,
-            seq_num,
-        ))) {
+        if let Err(e) =
+            self.object_sender
+                .send(EnsureObjectMessages::Data(SplitStreamWriterSenderData {
+                    external_data: data.to_vec(),
+                    inline_content,
+                    seq_num,
+                }))
+        {
             println!("Falied to send message. Err: {e:?}");
         }
 
         Ok(())
-
-        // .context("Falied to send data on channel in write_external")?;
-        // let id = self.repo.ensure_object(data)?;
-        // self.write_reference([0; 32], padding)
     }
 
     pub fn done(mut self) -> Result<Sha256HashValue> {
