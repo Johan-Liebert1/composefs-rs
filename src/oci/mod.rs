@@ -8,6 +8,7 @@ use async_compression::tokio::bufread::GzipDecoder;
 use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -15,7 +16,7 @@ use crate::{
     fsverity::Sha256HashValue,
     oci::tar::{get_entry, split_async},
     repository::Repository,
-    splitstream::{DigestMap, EnsureObjectMessages, FinishMessage},
+    splitstream::{DigestMap, EnsureObjectMessages, FinishMessage, SplitStreamWriter},
     util::parse_sha256,
 };
 
@@ -43,6 +44,7 @@ struct ImageOp<'repo> {
     proxy: ImageProxy,
     img: OpenedImage,
     progress: MultiProgress,
+    thread_pool: ThreadPool,
 }
 
 fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256HashValue> {
@@ -61,11 +63,11 @@ fn sha256_from_digest(digest: &str) -> Result<Sha256HashValue> {
 
 type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
 
-// fn foo<T: Send>(x: T) {}
-//
-// fn bar(i: ImageOp) {
-//     foo(i);
-// }
+fn foo<T: Send>(x: T) {}
+
+fn bar(i: SplitStreamWriter) {
+    foo(i);
+}
 
 impl<'repo> ImageOp<'repo> {
     async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
@@ -76,11 +78,15 @@ impl<'repo> ImageOp<'repo> {
         let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
         let img = proxy.open_image(imgref).await.context("Opening image")?;
         let progress = MultiProgress::new();
+
+        let thread_pool = ThreadPoolBuilder::new().build().unwrap();
+
         Ok(ImageOp {
             repo,
             proxy,
             img,
             progress,
+            thread_pool,
         })
     }
 
@@ -117,10 +123,8 @@ impl<'repo> ImageOp<'repo> {
             );
             split_async(decoder, &mut splitstream).await?;
 
-            // let layer_id = self.repo.write_stream(splitstream, None)?;
-
             driver.await?;
-            // Ok(layer_id)
+
             Ok([0; 32])
         }
     }
