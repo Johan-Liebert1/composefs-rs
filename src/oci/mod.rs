@@ -16,8 +16,12 @@ use crate::{
     fsverity::Sha256HashValue,
     oci::tar::{get_entry, split_async},
     repository::Repository,
-    splitstream::{DigestMap, EnsureObjectMessages, FinishMessage, SplitStreamWriter},
+    splitstream::{
+        DigestMap, EnsureObjectMessages, FinishMessage, SplitStreamWriter, WriterMessages,
+        WriterMessagesData,
+    },
     util::parse_sha256,
+    zstd_encoder,
 };
 
 pub fn import_layer(
@@ -95,6 +99,8 @@ impl<'repo> ImageOp<'repo> {
         layer_sha256: &Sha256HashValue,
         descriptor: &Descriptor,
         done_chan_sender: Sender<(Sha256HashValue, Sha256HashValue)>,
+        layer_num: usize,
+        object_sender: crossbeam::channel::Sender<EnsureObjectMessages>,
     ) -> Result<Sha256HashValue> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
@@ -120,8 +126,9 @@ impl<'repo> ImageOp<'repo> {
                 None,
                 descriptor.size(),
                 done_chan_sender,
+                object_sender,
             );
-            split_async(decoder, &mut splitstream).await?;
+            split_async(decoder, &mut splitstream, layer_num).await?;
 
             driver.await?;
 
@@ -146,28 +153,33 @@ impl<'repo> ImageOp<'repo> {
             // We need to add the config to the repo.  We need to parse the config and make sure we
             // have all of the layers first.
             //
+
             self.progress
                 .println(format!("Fetching config {}", hex::encode(config_sha256)))?;
             let raw_config = self.proxy.fetch_config_raw(&self.img).await?;
             let config = ImageConfiguration::from_reader(raw_config.as_slice())?;
 
+            let (done_chan_sender, done_chan_recver, object_sender) = self.spawn_threads(&config);
+
             let mut config_maps = DigestMap::new();
 
-            // (layer_sha256, layer_id)
-            let (done_chan_send, done_chan_recv) =
-                std::sync::mpsc::channel::<(Sha256HashValue, Sha256HashValue)>();
-
-            for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
+            for (idx, (mld, cld)) in zip(manifest_layers, config.rootfs().diff_ids()).enumerate() {
                 let layer_sha256 = sha256_from_digest(cld)?;
 
-                self.ensure_layer(&layer_sha256, mld, done_chan_send.clone())
-                    .await
-                    .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                self.ensure_layer(
+                    &layer_sha256,
+                    mld,
+                    done_chan_sender.clone(),
+                    idx,
+                    object_sender.clone(),
+                )
+                .await
+                .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
             }
 
-            drop(done_chan_send);
+            drop(done_chan_sender);
 
-            while let Ok((layer_sha256, layer_id)) = done_chan_recv.recv() {
+            while let Ok((layer_sha256, layer_id)) = done_chan_recver.recv() {
                 println!(
                     "layerSha256: {:?}, layerId: {:?}",
                     hex::encode(layer_sha256),
@@ -183,15 +195,20 @@ impl<'repo> ImageOp<'repo> {
             // TODO:
             // This is only the config and metadata written
             // A single file at most, doesn't need to be in a separate thread
-            let mut splitstream =
-                self.repo
-                    .create_stream(Some(config_sha256), Some(config_maps), 1, done_chan_send);
+            let mut splitstream = self.repo.create_stream(
+                Some(config_sha256),
+                Some(config_maps),
+                1,
+                done_chan_send,
+                object_sender,
+            );
             splitstream.write_inline(&raw_config);
             splitstream
                 .object_sender
                 .send(EnsureObjectMessages::Finish(FinishMessage {
                     data: std::mem::take(&mut splitstream.inline_content),
                     total_msgs: 0,
+                    layer_num: todo!(),
                 }))?;
 
             let mut config_id = [0u8; 32];
@@ -211,6 +228,125 @@ impl<'repo> ImageOp<'repo> {
         }
     }
 
+    fn spawn_threads(
+        &self,
+        config: &ImageConfiguration,
+    ) -> (
+        std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
+        std::sync::mpsc::Receiver<(Sha256HashValue, Sha256HashValue)>,
+        crossbeam::channel::Sender<EnsureObjectMessages>,
+    ) {
+        use crossbeam::channel::{unbounded, Receiver, Sender};
+
+        let encoder_threads = 2;
+        let ensure_obj_threads = 4;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(encoder_threads + ensure_obj_threads)
+            .build()
+            .unwrap();
+
+        // We need this as writers have internal state that can't be shared between threads
+        //
+        // We'll actually need as many writers (not writer threads, but writer instances) as there are layers.
+        let writer_channels: Vec<(Sender<WriterMessages>, Receiver<WriterMessages>)> =
+            (0..encoder_threads).map(|_| unbounded()).collect();
+
+        let (object_sender, object_receiver) =
+            crossbeam::channel::unbounded::<EnsureObjectMessages>();
+
+        // (layer_sha256, layer_id)
+        let (done_chan_sender, done_chan_recver) =
+            std::sync::mpsc::channel::<(Sha256HashValue, Sha256HashValue)>();
+
+        let mut chunks: Vec<Vec<Sha256HashValue>> = config
+            .rootfs()
+            .diff_ids()
+            .iter()
+            .map(|x| sha256_from_digest(x).unwrap())
+            .collect::<Vec<Sha256HashValue>>()
+            .chunks(encoder_threads)
+            .map(|x| x.to_vec())
+            .collect();
+
+        for c in &chunks {
+            for cc in c {
+                println!("{:?}", hex::encode(cc));
+            }
+
+            println!("---------------------");
+        }
+
+
+        let _ = (0..encoder_threads)
+            .map(|i| {
+                let repository = self.repo.try_clone().unwrap();
+                let object_sender = object_sender.clone();
+                let done_chan_sender = done_chan_sender.clone();
+                let chunk = std::mem::take(&mut chunks[i]);
+                let receiver = writer_channels[i].1.clone();
+
+                pool.spawn({
+                    move || {
+                        let enc = zstd_encoder::MultipleZstdWriters::new(
+                            chunk,
+                            repository,
+                            object_sender,
+                            done_chan_sender,
+                        );
+
+                        enc.recv_data(receiver);
+
+                        println!("Exited enc.recv_data(receiver);");
+                    }
+                });
+            })
+            .collect::<Vec<()>>();
+
+        let _ = (0..ensure_obj_threads)
+            .map(|i| {
+                pool.spawn({
+                    let repository = self.repo.try_clone().unwrap();
+                    let writer_chan_sender = writer_channels[i % writer_channels.len()].0.clone();
+                    let object_receiver = object_receiver.clone();
+
+                    move || {
+                        while let Ok(data) = object_receiver.recv() {
+                            match data {
+                                EnsureObjectMessages::Data(data) => {
+                                    let digest_result = repository.ensure_object(&data.external_data);
+
+                                    let msg = WriterMessagesData {
+                                        // TODO: Handle error
+                                        digest: digest_result.unwrap(),
+                                        inline_content:data.inline_content,
+                                        external_data:data.external_data,
+                                        seq_num: data.seq_num,
+                                        layer_num: data.layer_num
+                                    };
+
+                                    if let Err(e) = writer_chan_sender.send(WriterMessages::WriteData(msg))
+                                    {
+                                        println!(
+                                            "Failed to ack message at the end for layer {}. Err: {}",
+                                            data.layer_num, e.to_string()
+                                        );
+                                    };
+                                }
+
+                                EnsureObjectMessages::Finish(final_msg) => {
+                                    writer_chan_sender.send(WriterMessages::Finish(final_msg));
+                                },
+                            }
+                        }
+                    }
+                });
+            })
+            .collect::<Vec<()>>();
+
+        return (done_chan_sender, done_chan_recver, object_sender);
+    }
+
     pub async fn pull(&self) -> Result<(Sha256HashValue, Sha256HashValue)> {
         let (_manifest_digest, raw_manifest) = self
             .proxy
@@ -223,6 +359,7 @@ impl<'repo> ImageOp<'repo> {
         let manifest = ImageManifest::from_reader(raw_manifest.as_slice())?;
         let config_descriptor = manifest.config();
         let layers = manifest.layers();
+
         self.ensure_config(layers, config_descriptor)
             .await
             .with_context(|| format!("Failed to pull config {config_descriptor:?}"))
@@ -302,7 +439,7 @@ pub fn write_config(
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
-    let mut stream = repo.create_stream(Some(sha256), Some(refs), todo!(), todo!());
+    let mut stream = repo.create_stream(Some(sha256), Some(refs), todo!(), todo!(), todo!());
     stream.write_inline(json_bytes);
     let id = repo.write_stream(stream, None)?;
     Ok((sha256, id))

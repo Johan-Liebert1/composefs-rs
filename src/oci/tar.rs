@@ -62,7 +62,7 @@ pub fn split<R: Read>(tar_stream: &mut R, writer: &mut SplitStreamWriter) -> Res
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
             // non-empty regular file: store the data in the object store
             let padding = buffer.split_off(actual_size);
-            writer.write_external(&buffer, padding, 0)?;
+            writer.write_external(&buffer, padding, 0, 0)?;
         } else {
             // else: store the data inline in the split stream
             writer.write_inline(&buffer);
@@ -74,6 +74,7 @@ pub fn split<R: Read>(tar_stream: &mut R, writer: &mut SplitStreamWriter) -> Res
 pub async fn split_async(
     mut tar_stream: impl AsyncRead + Unpin,
     writer: &mut SplitStreamWriter<'_>,
+    layer_num: usize,
 ) -> Result<()> {
     let mut seq_num = 0;
 
@@ -94,7 +95,7 @@ pub async fn split_async(
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
             // non-empty regular file: store the data in the object store
             let padding = buffer.split_off(actual_size);
-            writer.write_external(&buffer, padding, seq_num)?;
+            writer.write_external(&buffer, padding, seq_num, layer_num)?;
             seq_num += 1;
         } else {
             // else: store the data inline in the split stream
@@ -107,6 +108,7 @@ pub async fn split_async(
         .send(EnsureObjectMessages::Finish(FinishMessage {
             data: std::mem::take(&mut writer.inline_content),
             total_msgs: seq_num,
+            layer_num,
         }))?;
 
     Ok(())

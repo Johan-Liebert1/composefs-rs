@@ -1,17 +1,3 @@
-Problem
-
-While external entry is being written, a lot of inline content gets added to the inline buffer, and then things are screwed, because we don't know how much 
-was there BEFORE the external entry was sent to be written.
-
-Trial 1
-VecDeque<Vec<u8>>, pass an index of the final VecDeque entry to write. But here let's say external_entry1 sends index 1, and external_entry2 sends index 4
-but external_entry2 finishes before external_entry1, then everything until 4 will be written when 2-4 should've been written.
-
-Trial2
-Send the internal vec on the channel. Have the channel consume it. Should work out
-Can do with std::mem::take / mem::replace
-
-
 Update sha with the external (not digest) data first
 Then update sha with the padding
 Then take the digest of the data and do stuff
@@ -22,8 +8,6 @@ Then write the digest. Do not add the digest to the writer
 # multiple workers
 messages are received out of order and produce non deterministic SHA and verity
 
-
-
 Workers in thread pool
 
 Spwan, say 5 threads, 3 of which are `ensure_object` and 2 is the `encoder`, more like in 3:1 ratio (have to figure out how to sync these though)
@@ -31,3 +15,18 @@ Spwan, say 5 threads, 3 of which are `ensure_object` and 2 is the `encoder`, mor
 Probably can pass the entire SplitStreamWriter to the `encoder` thread.
 In the encoder thread, use corssbeam select to have something like Go's for { select {} }, this is because we'll have different receivers for different
 
+
+Problem 1
+
+How and where to spawn these threads
+
+Can't spawn them at the moment we see an external object, as that's kinda weird tbh
+
+Option 1: Spawn them at the top of `Oci::Pull`
+
+
+Problem 2
+
+How to figure out how many threads to spawn and how many of them are external object writers and how many will be zstd writers.
+
+Option 1: Have them in a 1:3 (zstd writers: object writers) ratio
