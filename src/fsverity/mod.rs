@@ -1,4 +1,4 @@
-use std::os::fd::AsFd;
+use std::{fmt::Debug, os::fd::AsFd};
 
 use anyhow::Result;
 use ioctl::MeasureVerityError;

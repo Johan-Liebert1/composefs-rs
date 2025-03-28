@@ -23,7 +23,7 @@ use crate::{
         Sha256HashValue,
     },
     mount::mount_fd,
-    splitstream::{DigestMap, SplitStreamReader, SplitStreamWriter},
+    splitstream::{DigestMap, EnsureObjectMessages, SplitStreamReader, SplitStreamWriter},
     util::{parse_sha256, proc_self_fd},
 };
 
@@ -146,8 +146,16 @@ impl Repository {
         maps: Option<DigestMap>,
         layer_size: u64,
         done_chan_sender: std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
+        object_sender: crossbeam::channel::Sender<EnsureObjectMessages>,
     ) -> SplitStreamWriter {
-        SplitStreamWriter::new(self, maps, sha256, layer_size, done_chan_sender)
+        SplitStreamWriter::new(
+            self,
+            maps,
+            sha256,
+            layer_size,
+            done_chan_sender,
+            object_sender,
+        )
     }
 
     fn parse_object_path(path: impl AsRef<[u8]>) -> Result<Sha256HashValue> {
@@ -285,7 +293,7 @@ impl Repository {
         let object_id = match self.has_stream(sha256)? {
             Some(id) => id,
             None => {
-                let mut writer = self.create_stream(Some(*sha256), None, todo!(), todo!());
+                let mut writer = self.create_stream(Some(*sha256), None, todo!(), todo!(), todo!());
                 callback(&mut writer)?;
                 let object_id = writer.done()?;
 
