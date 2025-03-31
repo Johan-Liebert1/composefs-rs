@@ -3,24 +3,19 @@
  * See doc/splitstream.md
  */
 
-use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
-    io::{BufReader, Read, Write},
-    thread::{self, JoinHandle},
-};
+use std::io::{BufReader, Read, Write};
 
 use crossbeam::channel::Sender;
 
 use anyhow::{bail, Result};
-use sha2::{Digest, Sha256};
-use zstd::stream::{read::Decoder, write::Encoder};
+use sha2::Sha256;
+use zstd::stream::read::Decoder;
 
 use crate::{
     fsverity::{FsVerityHashValue, Sha256HashValue},
     repository::Repository,
     util::read_exactish,
-    zstd_encoder,
+    zstd_encoder::ZstdWriter,
 };
 
 #[derive(Debug)]
@@ -69,9 +64,8 @@ impl DigestMap {
 pub struct SplitStreamWriter<'a> {
     repo: &'a Repository,
     pub(crate) inline_content: Vec<u8>,
-    writer: Encoder<'a, Vec<u8>>,
-    pub(crate) sha256: Option<(Sha256, Sha256HashValue)>,
-    pub(crate) object_sender: Sender<EnsureObjectMessages>,
+    writer: ZstdWriter,
+    pub(crate) object_sender: Option<Sender<EnsureObjectMessages>>,
 }
 
 impl std::fmt::Debug for SplitStreamWriter<'_> {
@@ -80,7 +74,6 @@ impl std::fmt::Debug for SplitStreamWriter<'_> {
         f.debug_struct("SplitStreamWriter")
             .field("repo", &self.repo)
             .field("inline_content", &self.inline_content)
-            // .field("sha256", &self.sha256)
             .finish()
     }
 }
@@ -137,113 +130,30 @@ pub(crate) enum EnsureObjectMessages {
 }
 
 impl SplitStreamWriter<'_> {
-    pub fn new(
+    pub(crate) fn new(
         repo: &Repository,
         refs: Option<DigestMap>,
         sha256: Option<Sha256HashValue>,
-        layer_size: u64,
-        done_chan_sender: std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
-        object_sender: Sender<EnsureObjectMessages>,
+        object_sender: Option<Sender<EnsureObjectMessages>>,
     ) -> SplitStreamWriter {
-        // let (object_sender, object_receiver) =
-        //     crossbeam::channel::unbounded::<EnsureObjectMessages>();
-
-        // let (writer_chan_sender, write_chan_receiver) =
-        //     crossbeam::channel::unbounded::<WriterMessages>();
-
         let inline_content = vec![];
-
-        // // spawn a thread for every ~100MB of data. This is completely arbitrary
-        // let num_threads = ((layer_size / (1024 * 1024)) / 100).max(1);
-
-        // println!("layer_size: {layer_size}");
-        // println!("num_threads: {num_threads}");
-
-        // let join_handles: Vec<JoinHandle<()>> = (0..num_threads)
-        //     .map(|_| {
-        //         thread::spawn({
-        //             let repository = repo.try_clone().unwrap();
-        //             let object_receiver = object_receiver.clone();
-        //             let writer_chan_sender = writer_chan_sender.clone();
-
-        //             let sha = hex::encode(sha256.unwrap().clone());
-
-        //             move || {
-        //                 while let Ok(data) = object_receiver.recv() {
-        //                     match data {
-        //                         EnsureObjectMessages::Data(data) => {
-        //                             let digest_result = repository.ensure_object(&data.external_data);
-
-        //                             let msg = WriterMessagesData{
-        //                                 // TODO: Handle error
-        //                                 digest: digest_result.unwrap(),
-        //                                 inline_content:data.inline_content,
-        //                                 external_data:data.external_data,
-        //                                 seq_num: data.seq_num
-        //                             };
-
-        //                             if let Err(e) = writer_chan_sender.send(WriterMessages::WriteData(msg))
-        //                             {
-        //                                 println!(
-        //                                     "Failed to ack message at the end for layer {sha}. Err: {}",
-        //                                     e.to_string()
-        //                                 );
-        //                             };
-        //                         }
-
-        //                         EnsureObjectMessages::Finish(final_msg) => {
-        //                             writer_chan_sender.send(WriterMessages::Finish(final_msg));
-        //                         },
-        //                     }
-        //                 }
-        //             }
-        //         })
-        //     })
-        //     .collect();
-
-        // thread::spawn({
-        //     let repository = repo.try_clone().unwrap();
-        //     let cloned_sender = object_sender.clone();
-
-        //     move || {
-        //         let enc = zstd_encoder::ZstdWriter::new(
-        //             sha256,
-        //             refs,
-        //             repository,
-        //             cloned_sender,
-        //             done_chan_sender,
-        //         );
-
-        //         enc.recv_data(write_chan_receiver);
-        //     }
-        // });
 
         SplitStreamWriter {
             repo,
             inline_content,
-            // not used
-            writer: Encoder::new(vec![], 0).unwrap(),
             object_sender,
-            // not used
-            sha256: sha256.map(|x| (Sha256::new(), x)),
+            writer: ZstdWriter::new(sha256, refs, repo.try_clone().unwrap()),
         }
     }
 
-    pub fn write_fragment(writer: &mut impl Write, size: usize, data: &[u8]) -> Result<()> {
-        writer.write_all(&(size as u64).to_le_bytes())?;
-        Ok(writer.write_all(data)?)
+    pub fn get_sha_builder(&self) -> &Option<(Sha256, Sha256HashValue)> {
+        &self.writer.sha256_builder
     }
 
     /// flush any buffered inline data, taking new_value as the new value of the buffer
     fn flush_inline(&mut self, new_value: Vec<u8>) -> Result<()> {
-        if !self.inline_content.is_empty() {
-            SplitStreamWriter::write_fragment(
-                &mut self.writer,
-                self.inline_content.len(),
-                &self.inline_content,
-            )?;
-            self.inline_content = new_value;
-        }
+        self.writer.flush_inline(&self.inline_content)?;
+        self.inline_content = new_value;
         Ok(())
     }
 
@@ -260,32 +170,35 @@ impl SplitStreamWriter<'_> {
         seq_num: usize,
         layer_num: usize,
     ) -> Result<()> {
-        let inline_content = std::mem::replace(&mut self.inline_content, padding);
+        match &self.object_sender {
+            Some(sender) => {
+                let inline_content = std::mem::replace(&mut self.inline_content, padding);
 
-        if let Err(e) =
-            self.object_sender
-                .send(EnsureObjectMessages::Data(SplitStreamWriterSenderData {
-                    external_data: data.to_vec(),
-                    inline_content,
-                    seq_num,
-                    layer_num,
-                }))
-        {
-            println!("Falied to send message. Err: {}", e.to_string());
-        }
+                if let Err(e) =
+                    sender.send(EnsureObjectMessages::Data(SplitStreamWriterSenderData {
+                        external_data: data.to_vec(),
+                        inline_content,
+                        seq_num,
+                        layer_num,
+                    }))
+                {
+                    println!("Falied to send message. Err: {}", e.to_string());
+                }
+            }
+
+            None => {
+                let id = self.repo.ensure_object(data)?;
+                self.writer.flush_inline(&padding)?;
+                self.writer.write_fragment(0, &id)?;
+            }
+        };
 
         Ok(())
     }
 
     pub fn done(mut self) -> Result<Sha256HashValue> {
         self.flush_inline(vec![])?;
-
-        if let Some((context, expected)) = self.sha256 {
-            if Into::<Sha256HashValue>::into(context.finalize()) != expected {
-                bail!("Content doesn't have expected SHA256 hash value!");
-            }
-        }
-
+        self.writer.finalize_sha256_builder()?;
         self.repo.ensure_object(&self.writer.finish()?)
     }
 }
