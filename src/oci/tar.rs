@@ -103,13 +103,13 @@ pub async fn split_async(
         }
     }
 
-    writer
-        .object_sender
-        .send(EnsureObjectMessages::Finish(FinishMessage {
+    if let Some(sender) = &writer.object_sender {
+        sender.send(EnsureObjectMessages::Finish(FinishMessage {
             data: std::mem::take(&mut writer.inline_content),
             total_msgs: seq_num,
             layer_num,
         }))?;
+    }
 
     Ok(())
 }

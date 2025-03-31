@@ -138,22 +138,13 @@ impl Repository {
     /// Creates a SplitStreamWriter for writing a split stream.
     /// You should write the data to the returned object and then pass it to .store_stream() to
     /// store the result.
-    pub fn create_stream(
+    pub(crate) fn create_stream(
         &self,
         sha256: Option<Sha256HashValue>,
         maps: Option<DigestMap>,
-        layer_size: u64,
-        done_chan_sender: std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
-        object_sender: crossbeam::channel::Sender<EnsureObjectMessages>,
+        object_sender: Option<crossbeam::channel::Sender<EnsureObjectMessages>>,
     ) -> SplitStreamWriter {
-        SplitStreamWriter::new(
-            self,
-            maps,
-            sha256,
-            layer_size,
-            done_chan_sender,
-            object_sender,
-        )
+        SplitStreamWriter::new(self, maps, sha256, object_sender)
     }
 
     fn parse_object_path(path: impl AsRef<[u8]>) -> Result<Sha256HashValue> {
@@ -241,9 +232,10 @@ impl Repository {
         writer: SplitStreamWriter,
         reference: Option<&str>,
     ) -> Result<Sha256HashValue> {
-        let Some((.., ref sha256)) = writer.sha256 else {
+        let Some((.., ref sha256)) = writer.get_sha_builder() else {
             bail!("Writer doesn't have sha256 enabled");
         };
+
         let stream_path = format!("streams/{}", hex::encode(sha256));
         let object_id = writer.done()?;
         let object_path = Repository::format_object_path(&object_id);
@@ -291,7 +283,7 @@ impl Repository {
         let object_id = match self.has_stream(sha256)? {
             Some(id) => id,
             None => {
-                let mut writer = self.create_stream(Some(*sha256), None, todo!(), todo!(), todo!());
+                let mut writer = self.create_stream(Some(*sha256), None, None);
                 callback(&mut writer)?;
                 let object_id = writer.done()?;
 

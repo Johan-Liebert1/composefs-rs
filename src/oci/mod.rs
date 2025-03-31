@@ -1,14 +1,13 @@
 pub mod image;
 pub mod tar;
 
-use std::{collections::HashMap, io::Read, iter::zip, path::Path, sync::mpsc::Sender};
+use std::{collections::HashMap, io::Read, iter::zip, path::Path};
 
 use anyhow::{bail, ensure, Context, Result};
 use async_compression::tokio::bufread::GzipDecoder;
 use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -16,10 +15,7 @@ use crate::{
     fsverity::Sha256HashValue,
     oci::tar::{get_entry, split_async},
     repository::Repository,
-    splitstream::{
-        DigestMap, EnsureObjectMessages, FinishMessage, SplitStreamWriter, WriterMessages,
-        WriterMessagesData,
-    },
+    splitstream::{DigestMap, EnsureObjectMessages, WriterMessages, WriterMessagesData},
     util::parse_sha256,
     zstd_encoder,
 };
@@ -48,7 +44,6 @@ struct ImageOp<'repo> {
     proxy: ImageProxy,
     img: OpenedImage,
     progress: MultiProgress,
-    thread_pool: ThreadPool,
 }
 
 fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256HashValue> {
@@ -67,12 +62,6 @@ fn sha256_from_digest(digest: &str) -> Result<Sha256HashValue> {
 
 type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
 
-fn foo<T: Send>(x: T) {}
-
-fn bar(i: SplitStreamWriter) {
-    foo(i);
-}
-
 impl<'repo> ImageOp<'repo> {
     async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
         let config = ImageProxyConfig {
@@ -83,14 +72,11 @@ impl<'repo> ImageOp<'repo> {
         let img = proxy.open_image(imgref).await.context("Opening image")?;
         let progress = MultiProgress::new();
 
-        let thread_pool = ThreadPoolBuilder::new().build().unwrap();
-
         Ok(ImageOp {
             repo,
             proxy,
             img,
             progress,
-            thread_pool,
         })
     }
 
@@ -98,7 +84,6 @@ impl<'repo> ImageOp<'repo> {
         &self,
         layer_sha256: &Sha256HashValue,
         descriptor: &Descriptor,
-        done_chan_sender: Sender<(Sha256HashValue, Sha256HashValue)>,
         layer_num: usize,
         object_sender: crossbeam::channel::Sender<EnsureObjectMessages>,
     ) -> Result<Sha256HashValue> {
@@ -121,13 +106,9 @@ impl<'repo> ImageOp<'repo> {
             self.progress
                 .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
             let decoder = GzipDecoder::new(progress);
-            let mut splitstream = self.repo.create_stream(
-                Some(*layer_sha256),
-                None,
-                descriptor.size(),
-                done_chan_sender,
-                object_sender,
-            );
+            let mut splitstream =
+                self.repo
+                    .create_stream(Some(*layer_sha256), None, Some(object_sender));
             split_async(decoder, &mut splitstream, layer_num).await?;
 
             driver.await?;
@@ -152,8 +133,6 @@ impl<'repo> ImageOp<'repo> {
         } else {
             // We need to add the config to the repo.  We need to parse the config and make sure we
             // have all of the layers first.
-            //
-
             self.progress
                 .println(format!("Fetching config {}", hex::encode(config_sha256)))?;
             let raw_config = self.proxy.fetch_config_raw(&self.img).await?;
@@ -166,63 +145,22 @@ impl<'repo> ImageOp<'repo> {
             for (idx, (mld, cld)) in zip(manifest_layers, config.rootfs().diff_ids()).enumerate() {
                 let layer_sha256 = sha256_from_digest(cld)?;
 
-                self.ensure_layer(
-                    &layer_sha256,
-                    mld,
-                    done_chan_sender.clone(),
-                    idx,
-                    object_sender.clone(),
-                )
-                .await
-                .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                self.ensure_layer(&layer_sha256, mld, idx, object_sender.clone())
+                    .await
+                    .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
             }
 
             drop(done_chan_sender);
 
             while let Ok((layer_sha256, layer_id)) = done_chan_recver.recv() {
-                println!(
-                    "layerSha256: {:?}, layerId: {:?}",
-                    hex::encode(layer_sha256),
-                    hex::encode(layer_id)
-                );
-
                 config_maps.insert(&layer_sha256, &layer_id);
             }
 
-            let (done_chan_send, done_chan_recv) =
-                std::sync::mpsc::channel::<(Sha256HashValue, Sha256HashValue)>();
-
-            // TODO:
-            // This is only the config and metadata written
-            // A single file at most, doesn't need to be in a separate thread
-            let mut splitstream = self.repo.create_stream(
-                Some(config_sha256),
-                Some(config_maps),
-                1,
-                done_chan_send,
-                object_sender,
-            );
+            let mut splitstream =
+                self.repo
+                    .create_stream(Some(config_sha256), Some(config_maps), None);
             splitstream.write_inline(&raw_config);
-            splitstream
-                .object_sender
-                .send(EnsureObjectMessages::Finish(FinishMessage {
-                    data: std::mem::take(&mut splitstream.inline_content),
-                    total_msgs: 0,
-                    layer_num: todo!(),
-                }))?;
-
-            let mut config_id = [0u8; 32];
-
-            while let Ok((layer_sha256, layer_id)) = done_chan_recv.recv() {
-                println!(
-                    "layerSha256: {:?}, layerId: {:?}",
-                    hex::encode(layer_sha256),
-                    hex::encode(layer_id)
-                );
-
-                config_id = layer_id;
-                break;
-            }
+            let config_id = self.repo.write_stream(splitstream, None)?;
 
             Ok((config_sha256, config_id))
         }
@@ -238,7 +176,7 @@ impl<'repo> ImageOp<'repo> {
     ) {
         use crossbeam::channel::{unbounded, Receiver, Sender};
 
-        let encoder_threads = 2;
+        let encoder_threads = 1;
         let ensure_obj_threads = 4;
 
         let pool = rayon::ThreadPoolBuilder::new()
@@ -265,18 +203,9 @@ impl<'repo> ImageOp<'repo> {
             .iter()
             .map(|x| sha256_from_digest(x).unwrap())
             .collect::<Vec<Sha256HashValue>>()
-            .chunks(encoder_threads)
+            .chunks((config.rootfs().diff_ids().len() + encoder_threads - 1) / encoder_threads)
             .map(|x| x.to_vec())
             .collect();
-
-        for c in &chunks {
-            for cc in c {
-                println!("{:?}", hex::encode(cc));
-            }
-
-            println!("---------------------");
-        }
-
 
         let _ = (0..encoder_threads)
             .map(|i| {
@@ -285,6 +214,8 @@ impl<'repo> ImageOp<'repo> {
                 let done_chan_sender = done_chan_sender.clone();
                 let chunk = std::mem::take(&mut chunks[i]);
                 let receiver = writer_channels[i].1.clone();
+
+                println!("Sending {} chunks to encoder thread {i}", chunk.len());
 
                 pool.spawn({
                     move || {
@@ -296,8 +227,6 @@ impl<'repo> ImageOp<'repo> {
                         );
 
                         enc.recv_data(receiver);
-
-                        println!("Exited enc.recv_data(receiver);");
                     }
                 });
             })
@@ -335,7 +264,11 @@ impl<'repo> ImageOp<'repo> {
                                 }
 
                                 EnsureObjectMessages::Finish(final_msg) => {
-                                    writer_chan_sender.send(WriterMessages::Finish(final_msg));
+                                    let layer_num = final_msg.layer_num;
+
+                                    if let Err(e) = writer_chan_sender.send(WriterMessages::Finish(final_msg)) {
+                                        println!("Failed to send final message for layer {layer_num}. Err: {}", e.to_string())
+                                    }
                                 },
                             }
                         }
@@ -439,7 +372,7 @@ pub fn write_config(
     let json = config.to_string()?;
     let json_bytes = json.as_bytes();
     let sha256 = hash(json_bytes);
-    let mut stream = repo.create_stream(Some(sha256), Some(refs), todo!(), todo!(), todo!());
+    let mut stream = repo.create_stream(Some(sha256), Some(refs), None);
     stream.write_inline(json_bytes);
     let id = repo.write_stream(stream, None)?;
     Ok((sha256, id))
