@@ -88,10 +88,7 @@ pub(crate) struct FinishMessage {
 #[derive(Eq, Debug)]
 pub(crate) struct WriterMessagesData {
     pub(crate) digest: Sha256HashValue,
-    pub(crate) inline_content: Vec<u8>,
-    pub(crate) external_data: Vec<u8>,
-    pub(crate) seq_num: usize,
-    pub(crate) layer_num: usize,
+    pub(crate) object_data: SplitStreamWriterSenderData,
 }
 
 #[derive(Debug)]
@@ -102,22 +99,25 @@ pub(crate) enum WriterMessages {
 
 impl PartialEq for WriterMessagesData {
     fn eq(&self, other: &Self) -> bool {
-        self.seq_num.eq(&other.seq_num)
+        self.object_data.seq_num.eq(&other.object_data.seq_num)
     }
 }
 
 impl PartialOrd for WriterMessagesData {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.seq_num.partial_cmp(&other.seq_num)
+        self.object_data
+            .seq_num
+            .partial_cmp(&other.object_data.seq_num)
     }
 }
 
 impl Ord for WriterMessagesData {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.seq_num.cmp(&other.seq_num)
+        self.object_data.seq_num.cmp(&other.object_data.seq_num)
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SplitStreamWriterSenderData {
     pub(crate) external_data: Vec<u8>,
     pub(crate) inline_content: Vec<u8>,
@@ -128,6 +128,11 @@ pub(crate) enum EnsureObjectMessages {
     Data(SplitStreamWriterSenderData),
     Finish(FinishMessage),
 }
+
+pub(crate) type ResultChannelSender =
+    std::sync::mpsc::Sender<Result<(Sha256HashValue, Sha256HashValue)>>;
+pub(crate) type ResultChannelReceiver =
+    std::sync::mpsc::Receiver<Result<(Sha256HashValue, Sha256HashValue)>>;
 
 impl SplitStreamWriter<'_> {
     pub(crate) fn new(
@@ -165,7 +170,7 @@ impl SplitStreamWriter<'_> {
 
     pub fn write_external(
         &mut self,
-        data: &[u8],
+        data: Vec<u8>,
         padding: Vec<u8>,
         seq_num: usize,
         layer_num: usize,
@@ -176,7 +181,7 @@ impl SplitStreamWriter<'_> {
 
                 if let Err(e) =
                     sender.send(EnsureObjectMessages::Data(SplitStreamWriterSenderData {
-                        external_data: data.to_vec(),
+                        external_data: data,
                         inline_content,
                         seq_num,
                         layer_num,
@@ -187,7 +192,7 @@ impl SplitStreamWriter<'_> {
             }
 
             None => {
-                let id = self.repo.ensure_object(data)?;
+                let id = self.repo.ensure_object(&data)?;
                 self.writer.flush_inline(&padding)?;
                 self.writer.write_fragment(0, &id)?;
             }
