@@ -89,35 +89,33 @@ impl<'repo> ImageOp<'repo> {
         descriptor: &Descriptor,
         layer_num: usize,
         object_sender: crossbeam::channel::Sender<EnsureObjectMessages>,
-    ) -> Result<Sha256HashValue> {
+    ) -> Result<()> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
         // fsverity digest for the corresponding splitstream.
 
-        if let Some(layer_id) = self.repo.check_stream(layer_sha256)? {
-            self.progress
-                .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
-            Ok(layer_id)
-        } else {
-            // Otherwise, we need to fetch it...
-            let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
-            let bar = self.progress.add(ProgressBar::new(descriptor.size()));
-            bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
-                .unwrap()
-                .progress_chars("##-"));
-            let progress = bar.wrap_async_read(blob_reader);
-            self.progress
-                .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
-            let decoder = GzipDecoder::new(progress);
-            let mut splitstream =
-                self.repo
-                    .create_stream(Some(*layer_sha256), None, Some(object_sender));
-            split_async(decoder, &mut splitstream, layer_num).await?;
+        // Otherwise, we need to fetch it...
+        let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
+        let bar = self.progress.add(ProgressBar::new(descriptor.size()));
+        bar.set_style(
+            ProgressStyle::with_template(
+                "[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        let progress = bar.wrap_async_read(blob_reader);
+        self.progress
+            .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
+        let decoder = GzipDecoder::new(progress);
+        let mut splitstream =
+            self.repo
+                .create_stream(Some(*layer_sha256), None, Some(object_sender));
+        split_async(decoder, &mut splitstream, layer_num).await?;
 
-            driver.await?;
+        driver.await?;
 
-            Ok([0; 32])
-        }
+        Ok(())
     }
 
     pub async fn ensure_config(
@@ -148,9 +146,16 @@ impl<'repo> ImageOp<'repo> {
             for (idx, (mld, cld)) in zip(manifest_layers, config.rootfs().diff_ids()).enumerate() {
                 let layer_sha256 = sha256_from_digest(cld)?;
 
-                self.ensure_layer(&layer_sha256, mld, idx, object_sender.clone())
-                    .await
-                    .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                if let Some(layer_id) = self.repo.check_stream(&layer_sha256)? {
+                    self.progress
+                        .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
+
+                    config_maps.insert(&layer_sha256, &layer_id);
+                } else {
+                    self.ensure_layer(&layer_sha256, mld, idx, object_sender.clone())
+                        .await
+                        .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                }
             }
 
             drop(done_chan_sender);
@@ -162,7 +167,7 @@ impl<'repo> ImageOp<'repo> {
                     }
 
                     Err(e) => {
-                        // stop all the threads and propagate this erorr upwards
+                        // stop all the threads and propagate this error upwards
                         return Err(e);
                     }
                 }
