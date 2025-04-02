@@ -15,7 +15,10 @@ use crate::{
     fsverity::Sha256HashValue,
     oci::tar::{get_entry, split_async},
     repository::Repository,
-    splitstream::{DigestMap, EnsureObjectMessages, WriterMessages, WriterMessagesData},
+    splitstream::{
+        DigestMap, EnsureObjectMessages, ResultChannelReceiver, ResultChannelSender,
+        WriterMessages, WriterMessagesData,
+    },
     util::parse_sha256,
     zstd_encoder,
 };
@@ -152,8 +155,17 @@ impl<'repo> ImageOp<'repo> {
 
             drop(done_chan_sender);
 
-            while let Ok((layer_sha256, layer_id)) = done_chan_recver.recv() {
-                config_maps.insert(&layer_sha256, &layer_id);
+            while let Ok(res) = done_chan_recver.recv() {
+                match res {
+                    Ok((layer_sha256, layer_id)) => {
+                        config_maps.insert(&layer_sha256, &layer_id);
+                    }
+
+                    Err(e) => {
+                        // stop all the threads and propagate this erorr upwards
+                        return Err(e);
+                    }
+                }
             }
 
             let mut splitstream =
@@ -170,17 +182,17 @@ impl<'repo> ImageOp<'repo> {
         &self,
         config: &ImageConfiguration,
     ) -> (
-        std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
-        std::sync::mpsc::Receiver<(Sha256HashValue, Sha256HashValue)>,
+        ResultChannelSender,
+        ResultChannelReceiver,
         crossbeam::channel::Sender<EnsureObjectMessages>,
     ) {
         use crossbeam::channel::{unbounded, Receiver, Sender};
 
-        let encoder_threads = 1;
-        let ensure_obj_threads = 4;
+        let encoder_threads = 2;
+        let external_object_writer_threads = 4;
 
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(encoder_threads + ensure_obj_threads)
+            .num_threads(encoder_threads + external_object_writer_threads)
             .build()
             .unwrap();
 
@@ -195,17 +207,31 @@ impl<'repo> ImageOp<'repo> {
 
         // (layer_sha256, layer_id)
         let (done_chan_sender, done_chan_recver) =
-            std::sync::mpsc::channel::<(Sha256HashValue, Sha256HashValue)>();
+            std::sync::mpsc::channel::<Result<(Sha256HashValue, Sha256HashValue)>>();
 
+        let chunk_len = (config.rootfs().diff_ids().len() + encoder_threads - 1) / encoder_threads;
+
+        // Divide the layers into chunks of some specific size so each worker
+        // thread can work on multiple deterministic layers
         let mut chunks: Vec<Vec<Sha256HashValue>> = config
             .rootfs()
             .diff_ids()
             .iter()
             .map(|x| sha256_from_digest(x).unwrap())
             .collect::<Vec<Sha256HashValue>>()
-            .chunks((config.rootfs().diff_ids().len() + encoder_threads - 1) / encoder_threads)
+            .chunks(chunk_len)
             .map(|x| x.to_vec())
             .collect();
+
+        // Mapping from layer_id -> index in writer_channels
+        // This is to make sure that all messages relating to a particular layer
+        // always reach the same writer
+        let layers_to_chunks = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| std::iter::repeat(i).take(chunk.len()).collect::<Vec<_>>())
+            .flatten()
+            .collect::<Vec<_>>();
 
         let _ = (0..encoder_threads)
             .map(|i| {
@@ -215,10 +241,11 @@ impl<'repo> ImageOp<'repo> {
                 let chunk = std::mem::take(&mut chunks[i]);
                 let receiver = writer_channels[i].1.clone();
 
-                println!("Sending {} chunks to encoder thread {i}", chunk.len());
-
                 pool.spawn({
                     move || {
+                        let start = i * (chunk_len);
+                        let end = start + chunk_len;
+
                         let enc = zstd_encoder::MultipleZstdWriters::new(
                             chunk,
                             repository,
@@ -226,17 +253,20 @@ impl<'repo> ImageOp<'repo> {
                             done_chan_sender,
                         );
 
-                        enc.recv_data(receiver);
+                        if let Err(e) = enc.recv_data(receiver, start, end) {
+                            println!("zstd_encoder returned with error: {}", e.to_string())
+                        }
                     }
                 });
             })
             .collect::<Vec<()>>();
 
-        let _ = (0..ensure_obj_threads)
-            .map(|i| {
+        let _ = (0..external_object_writer_threads)
+            .map(|_| {
                 pool.spawn({
                     let repository = self.repo.try_clone().unwrap();
-                    let writer_chan_sender = writer_channels[i % writer_channels.len()].0.clone();
+                    let writer_channels = writer_channels.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>();
+                    let layers_to_chunks = layers_to_chunks.clone();
                     let object_receiver = object_receiver.clone();
 
                     move || {
@@ -245,26 +275,28 @@ impl<'repo> ImageOp<'repo> {
                                 EnsureObjectMessages::Data(data) => {
                                     let digest_result = repository.ensure_object(&data.external_data);
 
+                                    let layer_num = data.layer_num;
+
+                                    let writer_chan_sender = &writer_channels[layers_to_chunks[layer_num]];
+
                                     let msg = WriterMessagesData {
                                         // TODO: Handle error
                                         digest: digest_result.unwrap(),
-                                        inline_content:data.inline_content,
-                                        external_data:data.external_data,
-                                        seq_num: data.seq_num,
-                                        layer_num: data.layer_num
+                                        object_data: data,
                                     };
 
                                     if let Err(e) = writer_chan_sender.send(WriterMessages::WriteData(msg))
                                     {
                                         println!(
-                                            "Failed to ack message at the end for layer {}. Err: {}",
-                                            data.layer_num, e.to_string()
+                                            "Failed to ack message at the end for layer {layer_num}. Err: {}",
+                                            e.to_string()
                                         );
                                     };
                                 }
 
                                 EnsureObjectMessages::Finish(final_msg) => {
                                     let layer_num = final_msg.layer_num;
+                                    let writer_chan_sender = &writer_channels[layers_to_chunks[final_msg.layer_num]];
 
                                     if let Err(e) = writer_chan_sender.send(WriterMessages::Finish(final_msg)) {
                                         println!("Failed to send final message for layer {layer_num}. Err: {}", e.to_string())

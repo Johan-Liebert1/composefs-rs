@@ -6,15 +6,15 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use zstd::Encoder;
 
 use crate::{
     fsverity::{FsVerityHashValue, Sha256HashValue},
     repository::Repository,
     splitstream::{
-        DigestMap, EnsureObjectMessages, FinishMessage, SplitStreamWriterSenderData,
-        WriterMessages, WriterMessagesData,
+        DigestMap, EnsureObjectMessages, FinishMessage, ResultChannelSender,
+        SplitStreamWriterSenderData, WriterMessages, WriterMessagesData,
     },
 };
 
@@ -31,7 +31,7 @@ pub(crate) struct MultiThreadedState {
     final_sha: Option<Sha256HashValue>,
     final_message: Option<FinishMessage>,
     object_sender: crossbeam::channel::Sender<EnsureObjectMessages>,
-    final_result_sender: std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
+    final_result_sender: ResultChannelSender,
 }
 
 pub(crate) enum WriterMode {
@@ -41,6 +41,7 @@ pub(crate) enum WriterMode {
 
 pub(crate) struct MultipleZstdWriters {
     writers: Vec<ZstdWriter>,
+    final_result_sender: ResultChannelSender,
 }
 
 impl MultipleZstdWriters {
@@ -48,9 +49,11 @@ impl MultipleZstdWriters {
         sha256: Vec<Sha256HashValue>,
         repository: Repository,
         object_sender: crossbeam::channel::Sender<EnsureObjectMessages>,
-        final_result_sender: std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
+        final_result_sender: ResultChannelSender,
     ) -> Self {
         Self {
+            final_result_sender: final_result_sender.clone(),
+
             writers: sha256
                 .iter()
                 .map(|sha| {
@@ -66,59 +69,53 @@ impl MultipleZstdWriters {
         }
     }
 
-    pub fn recv_data(mut self, enc_chan_recvr: crossbeam::channel::Receiver<WriterMessages>) {
-        // (layer num, writer idx)
-        let mut layers_to_writers: Vec<(usize, usize)> = vec![];
+    pub fn recv_data(
+        mut self,
+        enc_chan_recvr: crossbeam::channel::Receiver<WriterMessages>,
+        layer_num_start: usize,
+        layer_num_end: usize,
+    ) -> Result<()> {
+        assert!(layer_num_end >= layer_num_start);
+
+        let total_writers = self.writers.len();
+
+        // layers_to_writers[layer_num] = writer_idx
+        // Faster than a hash map
+        let mut layers_to_writers: Vec<usize> = vec![0; layer_num_end];
+
+        for (idx, i) in (layer_num_start..layer_num_end).enumerate() {
+            layers_to_writers[i] = idx
+        }
 
         let mut finished_writers = 0;
 
         while let Ok(data) = enc_chan_recvr.recv() {
             let layer_num = match &data {
-                WriterMessages::WriteData(d) => d.layer_num,
+                WriterMessages::WriteData(d) => d.object_data.layer_num,
                 WriterMessages::Finish(d) => d.layer_num,
             };
 
-            let mut writer: Option<&mut ZstdWriter> = None;
+            assert!(layer_num >= layer_num_start && layer_num <= layer_num_end);
 
-            for (l_num, w_idx) in &layers_to_writers {
-                if *l_num == layer_num {
-                    writer = Some(&mut self.writers[*w_idx]);
-                    break;
-                }
-            }
-
-            if writer.is_none() {
-                if self.writers.len() == layers_to_writers.len() {
-                    panic!("Ran out of writers. layers_to_writers = {layers_to_writers:?}, layer_num: {layer_num:?}, total_writers: {}", self.writers.len());
+            match self.writers[layers_to_writers[layer_num]].handle_received_data(data) {
+                Ok(t) => {
+                    if t {
+                        finished_writers += 1
+                    }
                 }
 
-                layers_to_writers.push((
-                    layer_num,
-                    match layers_to_writers.last() {
-                        Some((.., w_idx)) => {
-                            writer = Some(&mut self.writers[w_idx + 1]);
-                            w_idx + 1
-                        }
-                        None => {
-                            writer = Some(&mut self.writers[0]);
-                            0
-                        }
-                    },
-                ));
+                Err(e) => self
+                    .final_result_sender
+                    .send(Err(e))
+                    .context("Failed to send result on channel")?,
             }
 
-            if let Some(writer) = writer {
-                if writer.handle_received_data(data) {
-                    finished_writers += 1;
-                }
-            } else {
-                panic!("Writer was none");
-            }
-
-            if finished_writers == self.writers.len() {
+            if finished_writers == total_writers {
                 break;
             }
         }
+
+        Ok(())
     }
 }
 
@@ -128,7 +125,7 @@ impl ZstdWriter {
         refs: Option<DigestMap>,
         repository: Repository,
         object_sender: crossbeam::channel::Sender<EnsureObjectMessages>,
-        final_result_sender: std::sync::mpsc::Sender<(Sha256HashValue, Sha256HashValue)>,
+        final_result_sender: ResultChannelSender,
     ) -> Self {
         Self {
             writer: ZstdWriter::get_writer(refs),
@@ -215,7 +212,7 @@ impl ZstdWriter {
         Ok(())
     }
 
-    fn write_message(&mut self) {
+    fn write_message(&mut self) -> Result<()> {
         loop {
             // Gotta keep lifetime of the destructring inside the loop
             let state = self.get_state_mut();
@@ -224,17 +221,17 @@ impl ZstdWriter {
                 break;
             };
 
-            if data.0.seq_num != state.last {
+            if data.0.object_data.seq_num != state.last {
                 break;
             }
 
             let data = state.heap.pop().unwrap();
             state.last += 1;
 
-            self.flush_inline(&data.0.inline_content);
+            self.flush_inline(&data.0.object_data.inline_content)?;
 
             if let Some((sha256, ..)) = &mut self.sha256_builder {
-                sha256.update(data.0.external_data);
+                sha256.update(data.0.object_data.external_data);
             }
 
             if let Err(e) = self.write_fragment(0, &data.0.digest) {
@@ -248,15 +245,14 @@ impl ZstdWriter {
             // Haven't received all the messages so we reset the final_message field
             if self.get_state().last < final_msg.total_msgs {
                 self.get_state_mut().final_message = Some(final_msg);
-                return;
+                return Ok(());
             }
 
-            let sha = self
-                .handle_final_message(&final_msg.data, final_msg.layer_num)
-                .unwrap();
-
+            let sha = self.handle_final_message(final_msg).unwrap();
             self.get_state_mut().final_sha = Some(sha);
         }
+
+        Ok(())
     }
 
     fn add_message_to_heap(&mut self, recv_data: WriterMessagesData) {
@@ -289,12 +285,8 @@ impl ZstdWriter {
         self.writer.finish()
     }
 
-    fn handle_final_message(
-        &mut self,
-        inline_content: &Vec<u8>,
-        layer_num: usize,
-    ) -> Result<Sha256HashValue> {
-        self.flush_inline(&inline_content)?;
+    fn handle_final_message(&mut self, final_message: FinishMessage) -> Result<Sha256HashValue> {
+        self.flush_inline(&final_message.data)?;
 
         let writer = std::mem::replace(&mut self.writer, Encoder::new(vec![], 0).unwrap());
         let finished = writer.finish()?;
@@ -308,7 +300,7 @@ impl ZstdWriter {
                 external_data: finished,
                 inline_content: vec![],
                 seq_num: 0,
-                layer_num,
+                layer_num: final_message.layer_num,
             }))
         {
             println!("Failed to finish writer. Err: {e}");
@@ -319,7 +311,7 @@ impl ZstdWriter {
 
     // Cannot `take` ownership of self, as we'll need it later
     // returns whether finished or not
-    fn handle_received_data(&mut self, data: WriterMessages) -> bool {
+    fn handle_received_data(&mut self, data: WriterMessages) -> Result<bool> {
         match data {
             WriterMessages::WriteData(recv_data) => {
                 if let Some(final_sha) = self.get_state().final_sha {
@@ -327,7 +319,7 @@ impl ZstdWriter {
                     let stream_path = format!("streams/{}", hex::encode(final_sha));
 
                     let object_path = Repository::format_object_path(&recv_data.digest);
-                    self.repository.ensure_symlink(&stream_path, &object_path);
+                    self.repository.ensure_symlink(&stream_path, &object_path)?;
 
                     // if let Some(name) = reference {
                     //     let reference_path = format!("streams/refs/{name}");
@@ -337,23 +329,23 @@ impl ZstdWriter {
                     if let Err(e) = self
                         .get_state()
                         .final_result_sender
-                        .send((final_sha, recv_data.digest))
+                        .send(Ok((final_sha, recv_data.digest)))
                     {
                         println!("Failed to send final digest with err: {e:?}");
                     }
 
-                    return true;
+                    return Ok(true);
                 }
 
-                let seq_num = recv_data.seq_num;
+                let seq_num = recv_data.object_data.seq_num;
 
                 self.add_message_to_heap(recv_data);
 
                 if seq_num != self.get_state().last {
-                    return false;
+                    return Ok(false);
                 }
 
-                self.write_message();
+                self.write_message()?;
             }
 
             WriterMessages::Finish(final_msg) => {
@@ -367,16 +359,15 @@ impl ZstdWriter {
 
                 // write all pending messages
                 if !self.get_state().heap.is_empty() {
-                    self.write_message();
+                    self.write_message()?;
                 }
 
                 let total_msgs = final_msg.total_msgs;
-                let layer = final_msg.layer_num;
 
                 if self.get_state().last >= total_msgs {
                     // We have received all the messages
                     // Finalize
-                    let final_sha = self.handle_final_message(&final_msg.data, layer).unwrap();
+                    let final_sha = self.handle_final_message(final_msg).unwrap();
                     self.get_state_mut().final_sha = Some(final_sha);
                 } else {
                     // Haven't received all messages. Store the final message until we have
@@ -387,6 +378,6 @@ impl ZstdWriter {
             }
         }
 
-        return false;
+        return Ok(false);
     }
 }

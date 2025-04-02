@@ -62,7 +62,7 @@ pub fn split<R: Read>(tar_stream: &mut R, writer: &mut SplitStreamWriter) -> Res
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
             // non-empty regular file: store the data in the object store
             let padding = buffer.split_off(actual_size);
-            writer.write_external(&buffer, padding, 0, 0)?;
+            writer.write_external(buffer, padding, 0, 0)?;
         } else {
             // else: store the data inline in the split stream
             writer.write_inline(&buffer);
@@ -95,7 +95,7 @@ pub async fn split_async(
         if header.entry_type() == EntryType::Regular && actual_size > INLINE_CONTENT_MAX {
             // non-empty regular file: store the data in the object store
             let padding = buffer.split_off(actual_size);
-            writer.write_external(&buffer, padding, seq_num, layer_num)?;
+            writer.write_external(buffer, padding, seq_num, layer_num)?;
             seq_num += 1;
         } else {
             // else: store the data inline in the split stream
