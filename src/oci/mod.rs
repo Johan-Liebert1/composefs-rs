@@ -16,8 +16,8 @@ use crate::{
     oci::tar::{get_entry, split_async},
     repository::Repository,
     splitstream::{
-        DigestMap, EnsureObjectMessages, ResultChannelReceiver, ResultChannelSender,
-        WriterMessages, WriterMessagesData,
+        handle_external_object, DigestMap, EnsureObjectMessages, ResultChannelReceiver,
+        ResultChannelSender, WriterMessages,
     },
     util::parse_sha256,
     zstd_encoder,
@@ -161,16 +161,8 @@ impl<'repo> ImageOp<'repo> {
             drop(done_chan_sender);
 
             while let Ok(res) = done_chan_recver.recv() {
-                match res {
-                    Ok((layer_sha256, layer_id)) => {
-                        config_maps.insert(&layer_sha256, &layer_id);
-                    }
-
-                    Err(e) => {
-                        // stop all the threads and propagate this error upwards
-                        return Err(e);
-                    }
-                }
+                let (layer_sha256, layer_id) = res?;
+                config_maps.insert(&layer_sha256, &layer_id);
             }
 
             let mut splitstream =
@@ -204,11 +196,10 @@ impl<'repo> ImageOp<'repo> {
         // We need this as writers have internal state that can't be shared between threads
         //
         // We'll actually need as many writers (not writer threads, but writer instances) as there are layers.
-        let writer_channels: Vec<(Sender<WriterMessages>, Receiver<WriterMessages>)> =
+        let zstd_writer_channels: Vec<(Sender<WriterMessages>, Receiver<WriterMessages>)> =
             (0..encoder_threads).map(|_| unbounded()).collect();
 
-        let (object_sender, object_receiver) =
-            crossbeam::channel::unbounded::<EnsureObjectMessages>();
+        let (object_sender, object_receiver) = unbounded::<EnsureObjectMessages>();
 
         // (layer_sha256, layer_id)
         let (done_chan_sender, done_chan_recver) =
@@ -244,7 +235,7 @@ impl<'repo> ImageOp<'repo> {
                 let object_sender = object_sender.clone();
                 let done_chan_sender = done_chan_sender.clone();
                 let chunk = std::mem::take(&mut chunks[i]);
-                let receiver = writer_channels[i].1.clone();
+                let receiver = zstd_writer_channels[i].1.clone();
 
                 pool.spawn({
                     move || {
@@ -259,7 +250,8 @@ impl<'repo> ImageOp<'repo> {
                         );
 
                         if let Err(e) = enc.recv_data(receiver, start, end) {
-                            println!("zstd_encoder returned with error: {}", e.to_string())
+                            eprintln!("zstd_encoder returned with error: {}", e.to_string());
+                            return;
                         }
                     }
                 });
@@ -270,49 +262,30 @@ impl<'repo> ImageOp<'repo> {
             .map(|_| {
                 pool.spawn({
                     let repository = self.repo.try_clone().unwrap();
-                    let writer_channels = writer_channels.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>();
+                    let zstd_writer_channels = zstd_writer_channels
+                        .iter()
+                        .map(|(s, _)| s.clone())
+                        .collect::<Vec<_>>();
                     let layers_to_chunks = layers_to_chunks.clone();
-                    let object_receiver = object_receiver.clone();
+                    let external_object_receiver = object_receiver.clone();
 
                     move || {
-                        while let Ok(data) = object_receiver.recv() {
-                            match data {
-                                EnsureObjectMessages::Data(data) => {
-                                    let digest_result = repository.ensure_object(&data.external_data);
-
-                                    let layer_num = data.layer_num;
-
-                                    let writer_chan_sender = &writer_channels[layers_to_chunks[layer_num]];
-
-                                    let msg = WriterMessagesData {
-                                        // TODO: Handle error
-                                        digest: digest_result.unwrap(),
-                                        object_data: data,
-                                    };
-
-                                    if let Err(e) = writer_chan_sender.send(WriterMessages::WriteData(msg))
-                                    {
-                                        println!(
-                                            "Failed to ack message at the end for layer {layer_num}. Err: {}",
-                                            e.to_string()
-                                        );
-                                    };
-                                }
-
-                                EnsureObjectMessages::Finish(final_msg) => {
-                                    let layer_num = final_msg.layer_num;
-                                    let writer_chan_sender = &writer_channels[layers_to_chunks[final_msg.layer_num]];
-
-                                    if let Err(e) = writer_chan_sender.send(WriterMessages::Finish(final_msg)) {
-                                        println!("Failed to send final message for layer {layer_num}. Err: {}", e.to_string())
-                                    }
-                                },
-                            }
+                        if let Err(e) = handle_external_object(
+                            repository,
+                            external_object_receiver,
+                            zstd_writer_channels,
+                            layers_to_chunks,
+                        ) {
+                            eprintln!(
+                                "handle_external_object returned with error: {}",
+                                e.to_string()
+                            );
+                            return;
                         }
                     }
                 });
             })
-            .collect::<Vec<()>>();
+            .collect::<Vec<_>>();
 
         return (done_chan_sender, done_chan_recver, object_sender);
     }

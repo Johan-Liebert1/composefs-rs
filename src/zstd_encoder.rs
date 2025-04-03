@@ -128,7 +128,7 @@ impl ZstdWriter {
         final_result_sender: ResultChannelSender,
     ) -> Self {
         Self {
-            writer: ZstdWriter::get_writer(refs),
+            writer: ZstdWriter::instantiate_writer(refs),
             repository,
             sha256_builder: sha256.map(|x| (Sha256::new(), x)),
 
@@ -149,7 +149,7 @@ impl ZstdWriter {
         repository: Repository,
     ) -> Self {
         Self {
-            writer: ZstdWriter::get_writer(refs),
+            writer: ZstdWriter::instantiate_writer(refs),
             repository,
             sha256_builder: sha256.map(|x| (Sha256::new(), x)),
             mode: WriterMode::SingleThreaded,
@@ -172,7 +172,7 @@ impl ZstdWriter {
         return state;
     }
 
-    fn get_writer(refs: Option<DigestMap>) -> zstd::Encoder<'static, Vec<u8>> {
+    fn instantiate_writer(refs: Option<DigestMap>) -> zstd::Encoder<'static, Vec<u8>> {
         let mut writer = zstd::Encoder::new(vec![], 0).unwrap();
 
         match refs {
@@ -193,12 +193,12 @@ impl ZstdWriter {
         return writer;
     }
 
-    pub fn write_fragment(&mut self, size: usize, data: &[u8]) -> Result<()> {
+    pub(crate) fn write_fragment(&mut self, size: usize, data: &[u8]) -> Result<()> {
         self.writer.write_all(&(size as u64).to_le_bytes())?;
         Ok(self.writer.write_all(data)?)
     }
 
-    pub fn flush_inline(&mut self, inline_content: &Vec<u8>) -> Result<()> {
+    pub(crate) fn flush_inline(&mut self, inline_content: &Vec<u8>) -> Result<()> {
         if inline_content.is_empty() {
             return Ok(());
         }

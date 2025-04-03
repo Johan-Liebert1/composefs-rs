@@ -5,9 +5,9 @@
 
 use std::io::{BufReader, Read, Write};
 
-use crossbeam::channel::Sender;
+use crossbeam::channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use sha2::Sha256;
 use zstd::stream::read::Decoder;
 
@@ -65,7 +65,7 @@ pub struct SplitStreamWriter<'a> {
     repo: &'a Repository,
     pub(crate) inline_content: Vec<u8>,
     writer: ZstdWriter,
-    pub(crate) object_sender: Option<Sender<EnsureObjectMessages>>,
+    pub(crate) object_sender: Option<CrossbeamSender<EnsureObjectMessages>>,
 }
 
 impl std::fmt::Debug for SplitStreamWriter<'_> {
@@ -134,12 +134,52 @@ pub(crate) type ResultChannelSender =
 pub(crate) type ResultChannelReceiver =
     std::sync::mpsc::Receiver<Result<(Sha256HashValue, Sha256HashValue)>>;
 
+pub(crate) fn handle_external_object(
+    repository: Repository,
+    external_object_receiver: CrossbeamReceiver<EnsureObjectMessages>,
+    zstd_writer_channels: Vec<CrossbeamSender<WriterMessages>>,
+    layers_to_chunks: Vec<usize>,
+) -> Result<()> {
+    while let Ok(data) = external_object_receiver.recv() {
+        match data {
+            EnsureObjectMessages::Data(data) => {
+                let digest = repository.ensure_object(&data.external_data)?;
+                let layer_num = data.layer_num;
+                let writer_chan_sender = &zstd_writer_channels[layers_to_chunks[layer_num]];
+
+                let msg = WriterMessagesData {
+                    digest,
+                    object_data: data,
+                };
+
+                // `send` only fails if all receivers are dropped
+                writer_chan_sender
+                    .send(WriterMessages::WriteData(msg))
+                    .with_context(|| format!("Failed to send message for layer {layer_num}"))?;
+            }
+
+            EnsureObjectMessages::Finish(final_msg) => {
+                let layer_num = final_msg.layer_num;
+                let writer_chan_sender = &zstd_writer_channels[layers_to_chunks[layer_num]];
+
+                writer_chan_sender
+                    .send(WriterMessages::Finish(final_msg))
+                    .with_context(|| {
+                        format!("Failed to send final message for layer {layer_num}")
+                    })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl SplitStreamWriter<'_> {
     pub(crate) fn new(
         repo: &Repository,
         refs: Option<DigestMap>,
         sha256: Option<Sha256HashValue>,
-        object_sender: Option<Sender<EnsureObjectMessages>>,
+        object_sender: Option<CrossbeamSender<EnsureObjectMessages>>,
     ) -> SplitStreamWriter {
         let inline_content = vec![];
 
