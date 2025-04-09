@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     ffi::CStr,
     fs::File,
-    io::{ErrorKind, Read, Write},
+    io::{self, ErrorKind, Read, Write},
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
@@ -46,6 +46,12 @@ impl Repository {
         )
     }
 
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            repository: self.repository.try_clone()?,
+        })
+    }
+
     pub fn open_path(dirfd: impl AsFd, path: impl AsRef<Path>) -> Result<Repository> {
         let path = path.as_ref();
 
@@ -74,6 +80,54 @@ impl Repository {
             Errno::EXIST => Ok(()),
             _ => Err(e),
         })
+    }
+
+    pub async fn ensure_object_async(&self, data: &[u8]) -> Result<Sha256HashValue> {
+        let digest = FsVerityHasher::hash(data);
+        let dir = PathBuf::from(format!("objects/{:02x}", digest[0]));
+        let file = dir.join(hex::encode(&digest[1..]));
+
+        // fairly common...
+        if accessat(&self.repository, &file, Access::READ_OK, AtFlags::empty()) == Ok(()) {
+            return Ok(digest);
+        }
+
+        self.ensure_dir("objects")?;
+        self.ensure_dir(&dir)?;
+
+        let fd = openat(
+            &self.repository,
+            &dir,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::TMPFILE,
+            0o666.into(),
+        )?;
+        rustix::io::write(&fd, data)?; // TODO: no write_all() here...
+        fdatasync(&fd)?;
+
+        // We can't enable verity with an open writable fd, so re-open and close the old one.
+        let ro_fd = open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())?;
+        drop(fd);
+
+        fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&ro_fd)
+            .context("Re-validating verity digest")?;
+
+        // double-check
+        fsverity::ensure_verity(&ro_fd, &digest)?;
+
+        if let Err(err) = linkat(
+            CWD,
+            proc_self_fd(&ro_fd),
+            &self.repository,
+            file,
+            AtFlags::SYMLINK_FOLLOW,
+        ) {
+            if err.kind() != ErrorKind::AlreadyExists {
+                return Err(err.into());
+            }
+        }
+
+        drop(ro_fd);
+        Ok(digest)
     }
 
     pub fn ensure_object(&self, data: &[u8]) -> Result<Sha256HashValue> {

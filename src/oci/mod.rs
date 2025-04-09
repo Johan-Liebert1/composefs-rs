@@ -41,11 +41,12 @@ pub fn ls_layer(repo: &Repository, name: &str) -> Result<()> {
     Ok(())
 }
 
-struct ImageOp<'repo> {
-    repo: &'repo Repository,
+struct ImageOp {
+    repo: Repository,
     proxy: ImageProxy,
     img: OpenedImage,
     progress: MultiProgress,
+    img_ref: String,
 }
 
 fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256HashValue> {
@@ -64,8 +65,78 @@ fn sha256_from_digest(digest: &str) -> Result<Sha256HashValue> {
 
 type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
 
-impl<'repo> ImageOp<'repo> {
-    async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
+async fn ensure_layer(
+    progress: MultiProgress,
+    repo: Repository,
+    layer_sha256: Sha256HashValue,
+    descriptor: Descriptor,
+    imgref: &str,
+) -> Result<Sha256HashValue> {
+    // Otherwise, we need to fetch it...
+    // let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, &descriptor).await?;
+
+    let skopeo_cmd = if imgref.starts_with("containers-storage:") {
+        let mut cmd = Command::new("podman");
+        cmd.args(["unshare", "skopeo"]);
+        Some(cmd)
+    } else {
+        None
+    };
+
+    let config = ImageProxyConfig {
+        skopeo_cmd,
+        // auth_anonymous: true, debug: true, insecure_skip_tls_verification: Some(true),
+        ..ImageProxyConfig::default()
+    };
+    let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
+    let img = proxy.open_image(imgref).await.context("Opening image")?;
+
+    let (blob_reader, driver) = proxy.get_descriptor(&img, &descriptor).await?;
+
+    let fut = tokio::spawn({
+        async move {
+            // See https://github.com/containers/containers-image-proxy-rs/issues/71
+            let blob_reader = blob_reader.take(descriptor.size());
+
+            let bar = progress.add(ProgressBar::new(descriptor.size()));
+            bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
+                .unwrap()
+                .progress_chars("##-"));
+
+            let progress_bar = bar.wrap_async_read(blob_reader);
+            progress.println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
+
+            let mut splitstream = repo.create_stream(Some(layer_sha256), None);
+            match descriptor.media_type() {
+                MediaType::ImageLayer => {
+                    split_async(progress_bar, &mut splitstream).await?;
+                }
+                MediaType::ImageLayerGzip => {
+                    split_async(GzipDecoder::new(progress_bar), &mut splitstream).await?;
+                }
+                MediaType::ImageLayerZstd => {
+                    split_async(ZstdDecoder::new(progress_bar), &mut splitstream).await?;
+                }
+                other => bail!("Unsupported layer media type {:?}", other),
+            };
+
+            let layer_id = repo.write_stream(splitstream, None)?;
+
+            Ok(layer_id)
+        }
+    });
+
+    let (layer, d) = tokio::join!(fut, driver);
+    d?;
+    let layer_id = layer??;
+
+    // driver.await?;
+
+    Ok(layer_id)
+}
+
+impl ImageOp {
+    async fn new(repo: Repository, imgref: &str) -> Result<Self> {
         // See https://github.com/containers/skopeo/issues/2563
         let skopeo_cmd = if imgref.starts_with("containers-storage:") {
             let mut cmd = Command::new("podman");
@@ -88,52 +159,70 @@ impl<'repo> ImageOp<'repo> {
             proxy,
             img,
             progress,
+            img_ref: imgref.into(),
         })
     }
 
+    #[allow(dead_code)]
     pub async fn ensure_layer(
         &self,
-        layer_sha256: &Sha256HashValue,
-        descriptor: &Descriptor,
+        layer_sha256: Sha256HashValue,
+        descriptor: Descriptor,
     ) -> Result<Sha256HashValue> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
         // fsverity digest for the corresponding splitstream.
 
-        if let Some(layer_id) = self.repo.check_stream(layer_sha256)? {
+        if let Some(layer_id) = self.repo.check_stream(&layer_sha256)? {
             self.progress
                 .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
             Ok(layer_id)
         } else {
             // Otherwise, we need to fetch it...
-            let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
+            let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, &descriptor).await?;
 
-            // See https://github.com/containers/containers-image-proxy-rs/issues/71
-            let blob_reader = blob_reader.take(descriptor.size());
+            let fut = tokio::spawn({
+                let progress_clone = self.progress.clone();
+                let repo = self.repo.try_clone()?;
 
-            let bar = self.progress.add(ProgressBar::new(descriptor.size()));
-            bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
+                async move {
+                    // See https://github.com/containers/containers-image-proxy-rs/issues/71
+                    let blob_reader = blob_reader.take(descriptor.size());
+
+                    let bar = progress_clone.add(ProgressBar::new(descriptor.size()));
+                    bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
                 .unwrap()
                 .progress_chars("##-"));
-            let progress = bar.wrap_async_read(blob_reader);
-            self.progress
-                .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
+                    let progress = bar.wrap_async_read(blob_reader);
+                    progress_clone
+                        .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
 
-            let mut splitstream = self.repo.create_stream(Some(*layer_sha256), None);
-            match descriptor.media_type() {
-                MediaType::ImageLayer => {
-                    split_async(progress, &mut splitstream).await?;
+                    let mut splitstream = repo.create_stream(Some(layer_sha256), None);
+                    match descriptor.media_type() {
+                        MediaType::ImageLayer => {
+                            split_async(progress, &mut splitstream).await?;
+                        }
+                        MediaType::ImageLayerGzip => {
+                            split_async(GzipDecoder::new(progress), &mut splitstream).await?;
+                        }
+                        MediaType::ImageLayerZstd => {
+                            split_async(ZstdDecoder::new(progress), &mut splitstream).await?;
+                        }
+                        other => bail!("Unsupported layer media type {:?}", other),
+                    };
+
+                    let layer_id = repo.write_stream(splitstream, None)?;
+
+                    Ok(layer_id)
                 }
-                MediaType::ImageLayerGzip => {
-                    split_async(GzipDecoder::new(progress), &mut splitstream).await?;
-                }
-                MediaType::ImageLayerZstd => {
-                    split_async(ZstdDecoder::new(progress), &mut splitstream).await?;
-                }
-                other => bail!("Unsupported layer media type {:?}", other),
-            };
-            let layer_id = self.repo.write_stream(splitstream, None)?;
-            driver.await?;
+            });
+
+            let (layer, d) = tokio::join!(fut, driver);
+            d?;
+            let layer_id = layer??;
+
+            // driver.await?;
+
             Ok(layer_id)
         }
     }
@@ -170,12 +259,43 @@ impl<'repo> ImageOp<'repo> {
             let config = ImageConfiguration::from_reader(&raw_config[..])?;
 
             let mut config_maps = DigestMap::new();
+
+            // let join_set = tokio::task::JoinSet::new();
+
             for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
                 let layer_sha256 = sha256_from_digest(cld)?;
-                let layer_id = self
-                    .ensure_layer(&layer_sha256, mld)
-                    .await
-                    .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                // let layer_id = self
+                //     .ensure_layer(layer_sha256, mld.clone())
+                //     .await
+                //     .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                //
+
+                // join_set.spawn_blocking({
+                //     let progress = self.progress.clone();
+                //     let repo = self.repo.try_clone().unwrap();
+                //     let img_ref = self.img_ref.clone();
+
+                //     move || {
+                //         ensure_layer(
+                //             progress,
+                //             repo,
+                //             layer_sha256,
+                //             mld.clone(),
+                //             &img_ref,
+                //         )
+                //     }
+                // });
+
+                let layer_id = ensure_layer(
+                    self.progress.clone(),
+                    self.repo.try_clone()?,
+                    layer_sha256,
+                    mld.clone(),
+                    &self.img_ref,
+                )
+                .await
+                .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+
                 config_maps.insert(&layer_sha256, &layer_id);
             }
 
@@ -209,8 +329,9 @@ impl<'repo> ImageOp<'repo> {
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
-pub async fn pull(repo: &Repository, imgref: &str, reference: Option<&str>) -> Result<()> {
-    let op = ImageOp::new(repo, imgref).await?;
+pub async fn pull(repo: Repository, imgref: &str, reference: Option<&str>) -> Result<()> {
+    let op = ImageOp::new(repo.try_clone()?, imgref).await?;
+
     let (sha256, id) = op
         .pull()
         .await
@@ -219,6 +340,7 @@ pub async fn pull(repo: &Repository, imgref: &str, reference: Option<&str>) -> R
     if let Some(name) = reference {
         repo.name_stream(sha256, name)?;
     }
+
     println!("sha256 {}", hex::encode(sha256));
     println!("verity {}", hex::encode(id));
     Ok(())
