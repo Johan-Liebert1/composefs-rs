@@ -144,6 +144,15 @@ impl SplitStreamWriter<'_> {
         SplitStreamWriter::write_fragment(&mut self.writer, 0, &reference)
     }
 
+    pub async fn write_external_async(&mut self, data: Vec<u8>, padding: Vec<u8>) -> Result<()> {
+        if let Some((ref mut sha256, ..)) = self.sha256 {
+            sha256.update(&data);
+            sha256.update(&padding);
+        }
+        let id = self.repo.ensure_object_async(data).await?;
+        self.write_reference(id, padding)
+    }
+
     pub fn write_external(&mut self, data: &[u8], padding: Vec<u8>) -> Result<()> {
         if let Some((ref mut sha256, ..)) = self.sha256 {
             sha256.update(data);

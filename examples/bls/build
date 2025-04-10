@@ -36,8 +36,8 @@ esac
 
 # cargo build --release "${features}"
 
-cp ../../target/release/cfsctl .
-cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
+# cp ../../target/release/cfsctl .
+# cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
 CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
@@ -48,7 +48,8 @@ mkdir -p tmp/sysroot/composefs
 #     -f "${containerfile}" \
 #     .
 
-BASE_ID=e1fb8456f3d8
+BASE_ID="9f2b036b238cfa67de1837a3de92ed8721470f7821d4385597e6f5763acff060"
+podman tag "$BASE_ID" "bls-build:$(date -u +"%Y-%m-%dT%H-%M")"
 ${CFSCTL} oci pull containers-storage:${BASE_ID}
 # BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
 # fsck.erofs "tmp/sysroot/composefs/images/${BASE_IMAGE_FSVERITY}"

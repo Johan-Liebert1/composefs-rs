@@ -11,7 +11,7 @@ use containers_image_proxy::{ImageProxy, ImageProxyConfig, OpenedImage};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufRead, AsyncReadExt};
 
 use crate::{
     fs::write_to_path,
@@ -46,7 +46,6 @@ struct ImageOp {
     proxy: ImageProxy,
     img: OpenedImage,
     progress: MultiProgress,
-    img_ref: String,
 }
 
 fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256HashValue> {
@@ -66,73 +65,44 @@ fn sha256_from_digest(digest: &str) -> Result<Sha256HashValue> {
 type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
 
 async fn ensure_layer(
-    progress: MultiProgress,
     repo: Repository,
+    blob_reader: impl AsyncBufRead + Send + Unpin,
     layer_sha256: Sha256HashValue,
     descriptor: Descriptor,
-    imgref: &str,
-) -> Result<Sha256HashValue> {
-    // Otherwise, we need to fetch it...
-    // let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, &descriptor).await?;
+    progress: MultiProgress,
+) -> Result<(Sha256HashValue, Sha256HashValue)> {
+    // See https://github.com/containers/containers-image-proxy-rs/issues/71
+    let blob_reader = blob_reader.take(descriptor.size());
 
-    let skopeo_cmd = if imgref.starts_with("containers-storage:") {
-        let mut cmd = Command::new("podman");
-        cmd.args(["unshare", "skopeo"]);
-        Some(cmd)
-    } else {
-        None
-    };
+    let bar = progress.add(ProgressBar::new(descriptor.size()));
+    bar.set_style(
+        ProgressStyle::with_template(
+            "[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
 
-    let config = ImageProxyConfig {
-        skopeo_cmd,
-        // auth_anonymous: true, debug: true, insecure_skip_tls_verification: Some(true),
-        ..ImageProxyConfig::default()
-    };
-    let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
-    let img = proxy.open_image(imgref).await.context("Opening image")?;
+    let progress_bar = bar.wrap_async_read(blob_reader);
+    progress.println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
 
-    let (blob_reader, driver) = proxy.get_descriptor(&img, &descriptor).await?;
-
-    let fut = tokio::spawn({
-        async move {
-            // See https://github.com/containers/containers-image-proxy-rs/issues/71
-            let blob_reader = blob_reader.take(descriptor.size());
-
-            let bar = progress.add(ProgressBar::new(descriptor.size()));
-            bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
-                .unwrap()
-                .progress_chars("##-"));
-
-            let progress_bar = bar.wrap_async_read(blob_reader);
-            progress.println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
-
-            let mut splitstream = repo.create_stream(Some(layer_sha256), None);
-            match descriptor.media_type() {
-                MediaType::ImageLayer => {
-                    split_async(progress_bar, &mut splitstream).await?;
-                }
-                MediaType::ImageLayerGzip => {
-                    split_async(GzipDecoder::new(progress_bar), &mut splitstream).await?;
-                }
-                MediaType::ImageLayerZstd => {
-                    split_async(ZstdDecoder::new(progress_bar), &mut splitstream).await?;
-                }
-                other => bail!("Unsupported layer media type {:?}", other),
-            };
-
-            let layer_id = repo.write_stream(splitstream, None)?;
-
-            Ok(layer_id)
+    let mut splitstream = repo.create_stream(Some(layer_sha256), None);
+    match descriptor.media_type() {
+        MediaType::ImageLayer => {
+            split_async(progress_bar, &mut splitstream).await?;
         }
-    });
+        MediaType::ImageLayerGzip => {
+            split_async(GzipDecoder::new(progress_bar), &mut splitstream).await?;
+        }
+        MediaType::ImageLayerZstd => {
+            split_async(ZstdDecoder::new(progress_bar), &mut splitstream).await?;
+        }
+        other => bail!("Unsupported layer media type {:?}", other),
+    };
 
-    let (layer, d) = tokio::join!(fut, driver);
-    d?;
-    let layer_id = layer??;
+    let layer_id = repo.write_stream(splitstream, None)?;
 
-    // driver.await?;
-
-    Ok(layer_id)
+    Ok((layer_sha256, layer_id))
 }
 
 impl ImageOp {
@@ -159,72 +129,7 @@ impl ImageOp {
             proxy,
             img,
             progress,
-            img_ref: imgref.into(),
         })
-    }
-
-    #[allow(dead_code)]
-    pub async fn ensure_layer(
-        &self,
-        layer_sha256: Sha256HashValue,
-        descriptor: Descriptor,
-    ) -> Result<Sha256HashValue> {
-        // We need to use the per_manifest descriptor to download the compressed layer but it gets
-        // stored in the repository via the per_config descriptor.  Our return value is the
-        // fsverity digest for the corresponding splitstream.
-
-        if let Some(layer_id) = self.repo.check_stream(&layer_sha256)? {
-            self.progress
-                .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
-            Ok(layer_id)
-        } else {
-            // Otherwise, we need to fetch it...
-            let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, &descriptor).await?;
-
-            let fut = tokio::spawn({
-                let progress_clone = self.progress.clone();
-                let repo = self.repo.try_clone()?;
-
-                async move {
-                    // See https://github.com/containers/containers-image-proxy-rs/issues/71
-                    let blob_reader = blob_reader.take(descriptor.size());
-
-                    let bar = progress_clone.add(ProgressBar::new(descriptor.size()));
-                    bar.set_style(ProgressStyle::with_template("[eta {eta}] {bar:40.cyan/blue} {decimal_bytes:>7}/{decimal_total_bytes:7} {msg}")
-                .unwrap()
-                .progress_chars("##-"));
-                    let progress = bar.wrap_async_read(blob_reader);
-                    progress_clone
-                        .println(format!("Fetching layer {}", hex::encode(layer_sha256)))?;
-
-                    let mut splitstream = repo.create_stream(Some(layer_sha256), None);
-                    match descriptor.media_type() {
-                        MediaType::ImageLayer => {
-                            split_async(progress, &mut splitstream).await?;
-                        }
-                        MediaType::ImageLayerGzip => {
-                            split_async(GzipDecoder::new(progress), &mut splitstream).await?;
-                        }
-                        MediaType::ImageLayerZstd => {
-                            split_async(ZstdDecoder::new(progress), &mut splitstream).await?;
-                        }
-                        other => bail!("Unsupported layer media type {:?}", other),
-                    };
-
-                    let layer_id = repo.write_stream(splitstream, None)?;
-
-                    Ok(layer_id)
-                }
-            });
-
-            let (layer, d) = tokio::join!(fut, driver);
-            d?;
-            let layer_id = layer??;
-
-            // driver.await?;
-
-            Ok(layer_id)
-        }
     }
 
     pub async fn ensure_config(
@@ -260,43 +165,45 @@ impl ImageOp {
 
             let mut config_maps = DigestMap::new();
 
-            // let join_set = tokio::task::JoinSet::new();
+            let mut join_set = tokio::task::JoinSet::new();
+            let mut drivers = vec![];
 
             for (mld, cld) in zip(manifest_layers, config.rootfs().diff_ids()) {
                 let layer_sha256 = sha256_from_digest(cld)?;
-                // let layer_id = self
-                //     .ensure_layer(layer_sha256, mld.clone())
-                //     .await
-                //     .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
-                //
 
-                // join_set.spawn_blocking({
-                //     let progress = self.progress.clone();
-                //     let repo = self.repo.try_clone().unwrap();
-                //     let img_ref = self.img_ref.clone();
+                // Check if we already have this layer
+                if let Some(layer_id) = self.repo.check_stream(&layer_sha256)? {
+                    self.progress
+                        .println(format!("Already have layer {}", hex::encode(layer_sha256)))?;
+                    config_maps.insert(&layer_sha256, &layer_id);
+                    continue;
+                }
 
-                //     move || {
-                //         ensure_layer(
-                //             progress,
-                //             repo,
-                //             layer_sha256,
-                //             mld.clone(),
-                //             &img_ref,
-                //         )
-                //     }
-                // });
+                join_set.spawn({
+                    let repo = self.repo.try_clone().unwrap();
+                    let mld = mld.clone();
+                    let progress = self.progress.clone();
 
-                let layer_id = ensure_layer(
-                    self.progress.clone(),
-                    self.repo.try_clone()?,
-                    layer_sha256,
-                    mld.clone(),
-                    &self.img_ref,
-                )
-                .await
-                .with_context(|| format!("Failed to fetch layer {cld} via {mld:?}"))?;
+                    let (blob_reader, driver) = self.proxy.get_descriptor(&self.img, &mld).await?;
 
+                    // Cannot send this across thread boundary, so we'll await it in this thread
+                    // itself
+                    drivers.push(driver);
+
+                    async move {
+                        ensure_layer(repo, blob_reader, layer_sha256, mld, progress).await
+                    }
+                });
+            }
+
+            // Await all operations as they complete
+            while let Some(res) = join_set.join_next().await {
+                let (layer_sha256, layer_id) = res??;
                 config_maps.insert(&layer_sha256, &layer_id);
+            }
+
+            for driver in drivers {
+                let _: () = driver.await?;
             }
 
             let mut splitstream = self
@@ -458,12 +365,17 @@ pub fn prepare_boot(
     verity: Option<&Sha256HashValue>,
     output_dir: &Path,
 ) -> Result<()> {
+    eprintln!("prepare_boot");
+
     let (config, refs) = open_config(repo, name, verity)?;
+
+    eprintln!("After open config");
 
     /* TODO: check created image ID against composefs label on container, if set */
     /* TODO: check created image ID against composefs= .cmdline in UKI or loader entry */
     crate::oci::image::create_image(repo, name, None, verity)?;
 
+    eprintln!("After create_image");
     /*
     let layer_digest = config
         .get_config_annotation("containers.composefs.attachments")
@@ -480,10 +392,20 @@ pub fn prepare_boot(
 
     // read the layer into a FileSystem object
     let mut filesystem = crate::image::FileSystem::new();
-    let mut split_stream = repo.open_stream(&hex::encode(layer_sha256), Some(layer_verity))?;
+    let mut split_stream = repo
+        .open_stream(&hex::encode(layer_sha256), Some(layer_verity))
+        .with_context(|| {
+            format!(
+                "open_stream failed for layer: {layer} and verity: {verity}",
+                layer = hex::encode(layer_sha256),
+                verity = hex::encode(layer_verity)
+            )
+        })?;
+
     while let Some(entry) = tar::get_entry(&mut split_stream)? {
         image::process_entry(&mut filesystem, entry)?;
     }
+    eprintln!("After all process_entry");
 
     let boot = filesystem
         .root

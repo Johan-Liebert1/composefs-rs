@@ -153,7 +153,8 @@ fn main() -> Result<()> {
                 println!("{}", hex::encode(image_id));
             }
             OciCommand::Pull { ref image, name } => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    // .worker_threads(8)
                     .enable_all()
                     .build()
                     .expect("Failed to build tokio runtime");

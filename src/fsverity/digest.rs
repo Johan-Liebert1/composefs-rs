@@ -40,6 +40,19 @@ pub struct FsVerityHasher {
 }
 
 impl FsVerityHasher {
+    pub fn hash_new(buffer: Vec<u8>) -> (Sha256HashValue, Vec<u8>) {
+        let mut hasher = FsVerityHasher::new();
+
+        let mut start = 0;
+        while start < buffer.len() {
+            let end = min(start + 4096, buffer.len());
+            hasher.add_data(&buffer[start..end]);
+            start = end;
+        }
+
+        (hasher.digest(), buffer)
+    }
+
     pub fn hash(buffer: &[u8]) -> Sha256HashValue {
         let mut hasher = FsVerityHasher::new();
 

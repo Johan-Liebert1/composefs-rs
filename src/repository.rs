@@ -82,8 +82,10 @@ impl Repository {
         })
     }
 
-    pub async fn ensure_object_async(&self, data: &[u8]) -> Result<Sha256HashValue> {
-        let digest = FsVerityHasher::hash(data);
+    pub async fn ensure_object_async(&self, data: Vec<u8>) -> Result<Sha256HashValue> {
+        let (digest, data) =
+            tokio::task::spawn_blocking(move || FsVerityHasher::hash_new(data)).await?;
+
         let dir = PathBuf::from(format!("objects/{:02x}", digest[0]));
         let file = dir.join(hex::encode(&digest[1..]));
 
@@ -92,41 +94,78 @@ impl Repository {
             return Ok(digest);
         }
 
-        self.ensure_dir("objects")?;
-        self.ensure_dir(&dir)?;
+        // self.ensure_dir("objects")?;
+        // self.ensure_dir(&dir)?;
 
-        let fd = openat(
-            &self.repository,
-            &dir,
-            OFlags::RDWR | OFlags::CLOEXEC | OFlags::TMPFILE,
-            0o666.into(),
-        )?;
-        rustix::io::write(&fd, data)?; // TODO: no write_all() here...
-        fdatasync(&fd)?;
+        let fd = tokio::task::spawn_blocking({
+            let repo = self.repository.try_clone()?;
 
-        // We can't enable verity with an open writable fd, so re-open and close the old one.
-        let ro_fd = open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())?;
-        drop(fd);
+            move || {
+                mkdirat(&repo, "objects", 0o755.into()).or_else(|e| match e {
+                    Errno::EXIST => Ok(()),
+                    _ => Err(e),
+                })?;
 
-        fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&ro_fd)
-            .context("Re-validating verity digest")?;
+                mkdirat(&repo, &dir, 0o755.into()).or_else(|e| match e {
+                    Errno::EXIST => Ok(()),
+                    _ => Err(e),
+                })?;
 
-        // double-check
-        fsverity::ensure_verity(&ro_fd, &digest)?;
+                let fd = openat(
+                    &repo,
+                    &dir,
+                    OFlags::RDWR | OFlags::CLOEXEC | OFlags::TMPFILE,
+                    0o666.into(),
+                )?;
 
-        if let Err(err) = linkat(
-            CWD,
-            proc_self_fd(&ro_fd),
-            &self.repository,
-            file,
-            AtFlags::SYMLINK_FOLLOW,
-        ) {
-            if err.kind() != ErrorKind::AlreadyExists {
-                return Err(err.into());
+                Ok::<OwnedFd, anyhow::Error>(fd)
             }
-        }
+        })
+        .await??;
 
-        drop(ro_fd);
+        tokio::task::spawn_blocking({
+            let fd = fd.try_clone()?;
+
+            move || {
+                rustix::io::write(&fd, data.as_ref())?; // TODO: no write_all() here...
+                fdatasync(&fd)?;
+
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .await??;
+
+        tokio::task::spawn_blocking({
+            let repo = self.repository.try_clone()?;
+
+            move || {
+                // We can't enable verity with an open writable fd, so re-open and close the old one.
+                let ro_fd = open(proc_self_fd(&fd), OFlags::RDONLY, Mode::empty())?;
+                drop(fd);
+
+                fs_ioc_enable_verity::<&OwnedFd, Sha256HashValue>(&ro_fd)
+                    .context("Re-validating verity digest")?;
+
+                // double-check
+                fsverity::ensure_verity(&ro_fd, &digest)?;
+
+                if let Err(err) = linkat(
+                    CWD,
+                    proc_self_fd(&ro_fd),
+                    &repo,
+                    file,
+                    AtFlags::SYMLINK_FOLLOW,
+                ) {
+                    if err.kind() != ErrorKind::AlreadyExists {
+                        return Err(err.into());
+                    }
+                }
+
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .await??;
+
         Ok(digest)
     }
 
@@ -183,8 +222,11 @@ impl Repository {
         filename: &str,
         expected_verity: &Sha256HashValue,
     ) -> Result<OwnedFd> {
-        let fd = self.openat(filename, OFlags::RDONLY)?;
-        fsverity::ensure_verity(&fd, expected_verity)?;
+        let fd = self
+            .openat(filename, OFlags::RDONLY)
+            .with_context(|| format!("Failed to open file: {filename}"))?;
+        fsverity::ensure_verity(&fd, expected_verity)
+            .with_context(|| format!("Failed to verify fsverity for file: {filename}"))?;
         Ok(fd)
     }
 
@@ -362,7 +404,8 @@ impl Repository {
         let file = File::from(if let Some(verity_hash) = verity {
             self.open_with_verity(&filename, verity_hash)?
         } else {
-            self.openat(&filename, OFlags::RDONLY)?
+            self.openat(&filename, OFlags::RDONLY)
+                .with_context(|| format!("Failed to open file {filename}"))?
         });
 
         SplitStreamReader::new(file)

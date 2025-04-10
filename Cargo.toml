@@ -33,7 +33,7 @@ sha2 = "0.10.8"
 tar = { version = "0.4.44", default-features = false }
 tempfile = "3.19.1"
 thiserror = "2.0.12"
-tokio = "1.44.1"
+tokio = { version = "1.44.1", features = ["rt-multi-thread"] }
 toml = "0.8.20"
 xxhash-rust = { version = "0.8.15", features = ["xxh32"] }
 zerocopy = { version = "0.8.24", features = ["derive"] }
