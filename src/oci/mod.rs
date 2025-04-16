@@ -1,5 +1,3 @@
-use std::process::Command;
-
 pub mod image;
 pub mod tar;
 
@@ -66,22 +64,38 @@ type ContentAndVerity = (Sha256HashValue, Sha256HashValue);
 
 impl<'repo> ImageOp<'repo> {
     async fn new(repo: &'repo Repository, imgref: &str) -> Result<Self> {
+        println!("in ImageOp new");
+
         // See https://github.com/containers/skopeo/issues/2563
         let skopeo_cmd = if imgref.starts_with("containers-storage:") {
-            let mut cmd = Command::new("podman");
-            cmd.args(["unshare", "skopeo"]);
-            Some(cmd)
+            // let mut cmd = Command::new("podman");
+            // cmd.args(["unshare", "skopeo"]);
+            // Some(cmd)
+            None
         } else {
             None
         };
+
+        println!("skopeo cmd: {skopeo_cmd:?}");
 
         let config = ImageProxyConfig {
             skopeo_cmd,
             // auth_anonymous: true, debug: true, insecure_skip_tls_verification: Some(true),
             ..ImageProxyConfig::default()
         };
-        let proxy = containers_image_proxy::ImageProxy::new_with_config(config).await?;
+
+        println!("config: {config:#?}");
+
+        let proxy = containers_image_proxy::ImageProxy::new_with_config(config)
+            .await
+            .with_context(|| "Failed to create image proxy")?;
+
+        println!("after creating proxy {proxy:?}");
+
         let img = proxy.open_image(imgref).await.context("Opening image")?;
+
+        println!("after creating image {img:?}");
+
         let progress = MultiProgress::new();
         Ok(ImageOp {
             repo,
@@ -196,6 +210,8 @@ impl<'repo> ImageOp<'repo> {
             .await
             .context("Fetching manifest")?;
 
+        println!("after fetch_manifest_raw_oci");
+
         // We need to add the manifest to the repo.  We need to parse the manifest and make
         // sure we have the config first (which will also pull in the layers).
         let manifest = ImageManifest::from_reader(raw_manifest.as_slice())?;
@@ -209,8 +225,17 @@ impl<'repo> ImageOp<'repo> {
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
-pub async fn pull(repo: &Repository, imgref: &str, reference: Option<&str>) -> Result<()> {
+pub async fn pull(
+    repo: &Repository,
+    imgref: &str,
+    reference: Option<&str>,
+) -> Result<(Sha256HashValue, Sha256HashValue)> {
+    println!("In Oci Pull");
+
     let op = ImageOp::new(repo, imgref).await?;
+
+    println!("after creating new image");
+
     let (sha256, id) = op
         .pull()
         .await
@@ -221,7 +246,9 @@ pub async fn pull(repo: &Repository, imgref: &str, reference: Option<&str>) -> R
     }
     println!("sha256 {}", hex::encode(sha256));
     println!("verity {}", hex::encode(id));
-    Ok(())
+
+    // imageid, verity
+    Ok((sha256, id))
 }
 
 pub fn open_config(

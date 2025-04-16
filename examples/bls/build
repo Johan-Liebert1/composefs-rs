@@ -43,35 +43,35 @@ CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 rm -rf tmp
 mkdir -p tmp/sysroot/composefs
 
-podman build \
-    --iidfile=tmp/base.iid \
-    -f "${containerfile}" \
-    .
+# podman build \
+#     --iidfile=tmp/base.iid \
+#     -f "${containerfile}" \
+#     .
 
-BASE_ID="$(sed s/sha256:// tmp/base.iid)"
-${CFSCTL} oci pull containers-storage:${BASE_ID}
-BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
-fsck.erofs "tmp/sysroot/composefs/images/${BASE_IMAGE_FSVERITY}"
-
-mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/work"
-mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/upper"
-mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/var"
-
-mkdir -p tmp/efi/loader
-echo 'timeout 3' > tmp/efi/loader/loader.conf
-mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
-cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
-cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
-${CFSCTL} oci prepare-boot "${BASE_ID}" tmp/efi
-
-OPTIONS="console=ttyS0,115200 composefs=${BASE_IMAGE_FSVERITY} rw"
-BLE="$(echo tmp/efi/loader/entries/*.conf)"
-test -f "${BLE}"
-if grep '^options ' "${BLE}"; then
-    sed -i "s|^options .*$|\0 ${OPTIONS}|" "${BLE}"
-else
-    echo "options    ${OPTIONS}" >> "${BLE}"
-fi
-sed -i 's@ /boot/@ /@' "${BLE}"
-
-../common/make-image "${os}-bls-efi.qcow2"
+# BASE_ID="$(sed s/sha256:// tmp/base.iid)"
+${CFSCTL} oci pull containers-storage:quay.io/pragyanpoudyal/bootc-update:latest
+# BASE_IMAGE_FSVERITY="$(${CFSCTL} oci create-image "${BASE_ID}")"
+# fsck.erofs "tmp/sysroot/composefs/images/${BASE_IMAGE_FSVERITY}"
+# 
+# mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/work"
+# mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/etc/upper"
+# mkdir -p "tmp/sysroot/state/${BASE_IMAGE_FSVERITY}/var"
+# 
+# mkdir -p tmp/efi/loader
+# echo 'timeout 3' > tmp/efi/loader/loader.conf
+# mkdir -p tmp/efi/EFI/BOOT tmp/efi/EFI/systemd
+# cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
+# cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
+# ${CFSCTL} oci prepare-boot "${BASE_ID}" tmp/efi
+# 
+# OPTIONS="console=ttyS0,115200 composefs=${BASE_IMAGE_FSVERITY} rw"
+# BLE="$(echo tmp/efi/loader/entries/*.conf)"
+# test -f "${BLE}"
+# if grep '^options ' "${BLE}"; then
+#     sed -i "s|^options .*$|\0 ${OPTIONS}|" "${BLE}"
+# else
+#     echo "options    ${OPTIONS}" >> "${BLE}"
+# fi
+# sed -i 's@ /boot/@ /@' "${BLE}"
+# 
+# ../common/make-image "${os}-bls-efi.qcow2"

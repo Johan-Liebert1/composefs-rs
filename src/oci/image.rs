@@ -17,6 +17,8 @@ use crate::{
 };
 
 pub fn process_entry(filesystem: &mut FileSystem, entry: TarEntry) -> Result<()> {
+    println!("{entry:#?}");
+
     let inode = match entry.item {
         TarItem::Directory => Inode::Directory(Box::from(Directory::new(entry.stat))),
         TarItem::Leaf(content) => Inode::Leaf(Rc::new(Leaf {

@@ -170,7 +170,10 @@ pub fn get_entry<R: Read>(reader: &mut SplitStreamReader<R>) -> Result<Option<Ta
         }
 
         let header = tar::Header::from_byte_slice(&buf);
-        assert!(header.as_ustar().is_some());
+
+        println!("header: {header:#?}");
+
+        // assert!(header.as_ustar().is_some());
 
         let size = header.entry_size()?;
 

@@ -140,7 +140,8 @@ impl Directory {
             dir = match component {
                 Component::RootDir => dir,
                 Component::Prefix(..) | Component::CurDir | Component::ParentDir => {
-                    return Err(ImageError::InvalidFilename(pathname.into()))
+                    println!("err in {}:{}", file!(), line!());
+                    return Err(ImageError::InvalidFilename(pathname.into()));
                 }
                 Component::Normal(filename) => match dir.entries.get(filename) {
                     Some(Inode::Directory(subdir)) => subdir,
@@ -164,7 +165,8 @@ impl Directory {
             dir = match component {
                 Component::RootDir => dir,
                 Component::Prefix(..) | Component::CurDir | Component::ParentDir => {
-                    return Err(ImageError::InvalidFilename(pathname.into()))
+                    println!("err in {}:{}", file!(), line!());
+                    return Err(ImageError::InvalidFilename(pathname.into()));
                 }
                 Component::Normal(filename) => match dir.entries.get_mut(filename) {
                     Some(Inode::Directory(subdir)) => subdir,
@@ -204,6 +206,7 @@ impl Directory {
         let path = Path::new(pathname);
 
         let Some(filename) = path.file_name() else {
+            println!("err in {}:{}", file!(), line!());
             return Err(ImageError::InvalidFilename(Box::from(pathname)));
         };
 
@@ -226,6 +229,7 @@ impl Directory {
         let path = Path::new(pathname);
 
         let Some(filename) = path.file_name() else {
+            println!("err in {}:{}", file!(), line!());
             return Err(ImageError::InvalidFilename(Box::from(pathname)));
         };
 

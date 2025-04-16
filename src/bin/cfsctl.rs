@@ -158,7 +158,10 @@ fn main() -> Result<()> {
                     .build()
                     .expect("Failed to build tokio runtime");
                 // And invoke the async_main
-                runtime.block_on(async move { oci::pull(&repo, image, name.as_deref()).await })?;
+                runtime.block_on(async move {
+                    oci::pull(&repo, image, name.as_deref()).await?;
+                    Ok::<(), anyhow::Error>(())
+                })?;
             }
             OciCommand::Seal { verity, ref name } => {
                 let (sha256, verity) =
