@@ -84,7 +84,7 @@ impl<'repo> ImageOp<'repo> {
             ..ImageProxyConfig::default()
         };
 
-        println!("config: {config:#?}");
+        eprintln!("\nconfig: {config:#?}\n");
 
         let proxy = containers_image_proxy::ImageProxy::new_with_config(config)
             .await
@@ -367,7 +367,12 @@ pub fn prepare_boot(
 
     /* TODO: check created image ID against composefs label on container, if set */
     /* TODO: check created image ID against composefs= .cmdline in UKI or loader entry */
-    crate::oci::image::create_image(repo, name, None, verity)?;
+    let verity = crate::oci::image::create_image(repo, name, None, verity)?;
+
+    eprintln!(
+        "\nverity into prepare_boot: {verity:?}\n verity returned by create_image in prepare_boot: {v}\n",
+        v = hex::encode(verity)
+    );
 
     /*
     let layer_digest = config
@@ -393,6 +398,8 @@ pub fn prepare_boot(
     let boot = filesystem
         .root
         .get_directory("composefs-meta/boot".as_ref())?;
+
+    println!("boot: {boot}");
 
     write_to_path(repo, boot, output_dir)
 }

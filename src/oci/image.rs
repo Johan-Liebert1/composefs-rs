@@ -17,8 +17,6 @@ use crate::{
 };
 
 pub fn process_entry(filesystem: &mut FileSystem, entry: TarEntry) -> Result<()> {
-    println!("{entry:#?}");
-
     let inode = match entry.item {
         TarItem::Directory => Inode::Directory(Box::from(Directory::new(entry.stat))),
         TarItem::Leaf(content) => Inode::Leaf(Rc::new(Leaf {
@@ -77,6 +75,8 @@ pub fn create_image(
     name: Option<&str>,
     verity: Option<&Sha256HashValue>,
 ) -> Result<Sha256HashValue> {
+    eprintln!("\nconfig: {config}, verity: {verity:?}, name: {name:?}\n");
+
     let mut filesystem = FileSystem::new();
 
     let mut config_stream = repo.open_stream(config, verity)?;
@@ -91,6 +91,15 @@ pub fn create_image(
             process_entry(&mut filesystem, entry)?;
         }
     }
+
+    let boot = filesystem
+        .root
+        .get_directory("composefs-meta/boot".as_ref());
+
+    match boot {
+        Ok(_) => eprintln!("Boot directory exists==========================="),
+        Err(_) => eprintln!("Boot directory DOESNT exist==========================="),
+    };
 
     selabel(&mut filesystem, repo)?;
     filesystem.done();

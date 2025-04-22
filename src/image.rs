@@ -1,9 +1,6 @@
+use core::fmt;
 use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    ffi::OsStr,
-    path::{Component, Path},
-    rc::Rc,
+    cell::RefCell, collections::BTreeMap, ffi::OsStr, fmt::Display, path::{Component, Path}, rc::Rc
 };
 
 use thiserror::Error;
@@ -376,6 +373,46 @@ pub struct FileSystem {
 impl Default for FileSystem {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Display for Directory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn fmt_dir(
+            dir: &Directory,
+            f: &mut fmt::Formatter<'_>,
+            prefix: &str,
+        ) -> fmt::Result {
+            let mut entries = dir.entries.iter().peekable();
+            while let Some((name, inode)) = entries.next() {
+                let is_last = entries.peek().is_none();
+                let connector = if is_last { "└── " } else { "├── " };
+                let new_prefix = if is_last {
+                    format!("{}    ", prefix)
+                } else {
+                    format!("{}│   ", prefix)
+                };
+
+                writeln!(f, "{}{}{}", prefix, connector, name.to_string_lossy())?;
+
+                match inode {
+                    Inode::Directory(d) => {
+                        fmt_dir(d, f, &new_prefix)?;
+                    }
+                    Inode::Leaf(_) => {}
+                }
+            }
+            Ok(())
+        }
+
+        fmt_dir(self, f, "")
+    }
+}
+
+impl Display for FileSystem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, ".")?;
+        writeln!(f, "{}", self.root)
     }
 }
 

@@ -127,7 +127,8 @@ impl Repository {
         expected_verity: &Sha256HashValue,
     ) -> Result<OwnedFd> {
         let fd = self.openat(filename, OFlags::RDONLY)?;
-        ensure_verity_equal(&fd, expected_verity)?;
+        // println!("Open with verity: {filename}, expected: {exp}", exp = hex::encode(expected_verity));
+        ensure_verity_equal(&fd, expected_verity).context("open_with_verity")?;
         Ok(fd)
     }
 
@@ -367,7 +368,8 @@ impl Repository {
 
         if !name.contains("/") {
             // A name with no slashes in it is taken to be a sha256 fs-verity digest
-            ensure_verity_equal(&image, &parse_sha256(name)?)?;
+            println!("open_image bs");
+            ensure_verity_equal(&image, &parse_sha256(name)?).context("Open image")?;
         }
 
         Ok(image)

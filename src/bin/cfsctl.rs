@@ -150,6 +150,10 @@ fn main() -> Result<()> {
             }
             OciCommand::CreateImage { config, name } => {
                 let image_id = oci::image::create_image(&repo, &config, name.as_deref(), None)?;
+                eprintln!(
+                    "\nImage ID returned by OciCommand::CreateImgae: {v}\n",
+                    v = hex::encode(image_id)
+                );
                 println!("{}", hex::encode(image_id));
             }
             OciCommand::Pull { ref image, name } => {
