@@ -95,7 +95,7 @@ impl fmt::Debug for Sha512HashValue {
 
 #[derive(Clone, Eq, FromBytes, Hash, Immutable, IntoBytes, KnownLayout, PartialEq, Unaligned)]
 #[repr(C)]
-pub struct Sha256HashValue([u8; 32]);
+pub struct Sha256HashValue(pub [u8; 32]);
 
 impl From<Output<Sha256>> for Sha256HashValue {
     fn from(value: Output<Sha256>) -> Self {

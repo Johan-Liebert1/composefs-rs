@@ -119,7 +119,7 @@ fn bind_mount(fd: impl AsFd, path: &str) -> rustix::io::Result<OwnedFd> {
 }
 
 fn mount_tmpfs() -> Result<OwnedFd> {
-    let tmpfs = FsHandle::open("tmpfs")?;
+    let tmpfs = FsHandle::open("tmpfs").context("Failed to open tmpfs")?;
     fsconfig_create(tmpfs.as_fd())?;
     Ok(fsmount(
         tmpfs.as_fd(),
@@ -132,7 +132,7 @@ fn overlay_state(base: impl AsFd, state: impl AsFd, source: &str) -> Result<()> 
     let upper = ensure_dir(state.as_fd(), "upper")?;
     let work = ensure_dir(state.as_fd(), "work")?;
 
-    let overlayfs = FsHandle::open("overlay")?;
+    let overlayfs = FsHandle::open("overlay").context("Failed to open overlayfs")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", source)?;
     overlayfs_set_fd(overlayfs.as_fd(), "workdir", work.as_fd())?;
     overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upper.as_fd())?;

@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
                 println!("{}", image_id.to_id());
             }
             OciCommand::Pull { ref image, name } => {
-                oci::pull(&Arc::new(repo), image, name.as_deref()).await?
+                oci::pull(&Arc::new(repo), image, name.as_deref()).await?;
             }
             OciCommand::Seal {
                 ref config_name,

@@ -13,6 +13,7 @@ use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 
+use crate::fsverity::Sha256HashValue;
 use crate::{
     fsverity::FsVerityHashValue,
     oci::tar::{get_entry, split_async},
@@ -238,7 +239,7 @@ pub async fn pull(
     repo: &Arc<Repository<impl FsVerityHashValue>>,
     imgref: &str,
     reference: Option<&str>,
-) -> Result<()> {
+) -> Result<(Sha256HashValue, impl FsVerityHashValue)> {
     let op = Arc::new(ImageOp::new(repo, imgref).await?);
     let (sha256, id) = op
         .pull()
@@ -250,7 +251,8 @@ pub async fn pull(
     }
     println!("sha256 {}", hex::encode(sha256));
     println!("verity {}", id.to_hex());
-    Ok(())
+
+    Ok((Sha256HashValue(sha256), id))
 }
 
 pub fn open_config<ObjectID: FsVerityHashValue>(
