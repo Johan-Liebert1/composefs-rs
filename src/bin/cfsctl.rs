@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
                 println!("{}", image_id.to_hex());
             }
             OciCommand::Pull { ref image, name } => {
-                oci::pull(&Arc::new(repo), image, name.as_deref()).await?
+                oci::pull(&Arc::new(repo), image, name.as_deref()).await?;
             }
             OciCommand::Seal { verity, ref name } => {
                 let (sha256, verity) = oci::seal(
