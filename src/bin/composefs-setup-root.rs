@@ -219,6 +219,8 @@ fn gpt_workaround() -> Result<()> {
 }
 
 fn setup_root(args: Args) -> Result<()> {
+    println!("args: {args:#?}");
+
     let config = match std::fs::read_to_string(args.config) {
         Ok(text) => toml::from_str(&text)?,
         Err(err) if err.kind() == ErrorKind::NotFound => Config::default(),

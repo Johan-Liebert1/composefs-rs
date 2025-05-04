@@ -1,20 +1,14 @@
 FROM fedora:41
 COPY extra /
+COPY cfsctl /usr/bin
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
-
-    dnf --setopt keepcache=1 install --allowerasing -y \
-        composefs \
-        dosfstools \
-        kernel \
-        openssh-server \
-        skopeo \
-        strace \
-        util-linux \
-        systemd
-
+    dnf --setopt keepcache=1 install --allowerasing -y systemd util-linux skopeo composefs strace dosfstools kernel openssh-server tree attr vim
     systemctl enable systemd-networkd
     passwd -d root
     mkdir /sysroot
+    mkdir /composefs-meta
+    mv /boot /composefs-meta
+    mkdir /boot
 EOF
-COPY cfsctl /usr/bin
+RUN true  # hack to get an extra layer
