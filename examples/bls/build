@@ -64,7 +64,7 @@ cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/systemd
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi tmp/efi/EFI/BOOT/BOOTX64.EFI
 ${CFSCTL} oci prepare-boot "${BASE_ID}" tmp/efi
 
-OPTIONS="console=ttyS0,115200 composefs=${BASE_IMAGE_FSVERITY} rw"
+OPTIONS="console=ttyS0,115200 composefs=${BASE_IMAGE_FSVERITY} rw init=/bin/bash"
 BLE="$(echo tmp/efi/loader/entries/*.conf)"
 test -f "${BLE}"
 if grep '^options ' "${BLE}"; then
