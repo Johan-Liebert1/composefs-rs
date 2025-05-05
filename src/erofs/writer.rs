@@ -399,7 +399,7 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
 struct InodeCollector<'a, ObjectID: FsVerityHashValue> {
     inodes: Vec<Inode<'a, ObjectID>>,
     hardlinks: HashMap<*const image::Leaf<ObjectID>, usize>,
-    file: std::fs::File,
+    file: Option<std::fs::File>,
 }
 
 impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
@@ -417,22 +417,26 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
                 OverlayMetacopy::new(id).as_bytes(),
             );
 
-            writeln!(
-                &mut self.file,
-                "Add xattr 'trusted.overlay.metacopy' with value {}",
-                id.to_hex()
-            )
-            .unwrap();
+            if let Some(f) = &mut self.file {
+                writeln!(
+                    f,
+                    "Add xattr 'trusted.overlay.metacopy' with value {}",
+                    id.to_hex()
+                )
+                .unwrap();
+            }
 
             let redirect = format!("/{}", id.to_object_pathname());
             xattrs.add(b"trusted.overlay.redirect", redirect.as_bytes());
 
-            writeln!(
-                &mut self.file,
-                "Add xattr 'trusted.overlay.redirect' with value {}",
-                redirect
-            )
-            .unwrap();
+            if let Some(f) = &mut self.file {
+                writeln!(
+                    f,
+                    "Add xattr 'trusted.overlay.redirect' with value {}",
+                    redirect
+                )
+                .unwrap();
+            }
         }
 
         // Add the normal xattrs.  They're already listed in sorted order.
@@ -529,7 +533,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         let mut this = Self {
             inodes: vec![],
             hardlinks: HashMap::new(),
-            file: std::fs::File::create("/home/pragyan/RedHat/composefs-rs/debug").unwrap(),
+            file: None, // Some(std::fs::File::create("/home/pragyan/RedHat/composefs-rs/debug").unwrap()),
         };
 
         // '..' of the root directory is the root directory again

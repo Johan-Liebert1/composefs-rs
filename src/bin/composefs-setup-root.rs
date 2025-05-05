@@ -48,7 +48,7 @@ struct MountConfig {
     transient: bool,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Debug)]
 struct Config {
     #[serde(default)]
     etc: MountConfig,
@@ -227,6 +227,8 @@ fn setup_root(args: Args) -> Result<()> {
         Err(err) => Err(err)?,
     };
 
+    println!("config: {config:#?}");
+
     let sysroot = open_dir(CWD, &args.sysroot)
         .with_context(|| format!("Failed to open sysroot {:?}", args.sysroot))?;
 
@@ -256,7 +258,12 @@ fn setup_root(args: Args) -> Result<()> {
     }
 
     match mount_at(&sysroot_clone, &new_root, "sysroot") {
-        Ok(()) | Err(Errno::NOENT) => {}
+        Ok(()) => {
+            println!("Successfully mounted sysroot_clone")
+        }
+        Err(Errno::NOENT) => {
+            println!("sysroot_clone mount, NOENT")
+        }
         Err(err) => Err(err)?,
     }
 
