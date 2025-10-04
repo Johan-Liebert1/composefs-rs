@@ -139,7 +139,7 @@ impl<'img> ImageVisitor<'img> {
         }
     }
 
-    fn visit_directory_block(&mut self, block: &DirectoryBlock, path: &Path) {
+    fn visit_directory_block(&mut self, block: &DirectoryBlock, path: &Path, path_to_find: &Path) {
         for entry in block.entries() {
             if entry.name == b"." || entry.name == b".." {
                 // TODO: maybe we want to follow those and let deduplication happen
@@ -148,11 +148,19 @@ impl<'img> ImageVisitor<'img> {
             self.visit_inode(
                 entry.header.inode_offset.get(),
                 &path.join(OsStr::from_bytes(entry.name)),
+                path_to_find,
             );
         }
     }
 
-    fn visit_inode(&mut self, id: u64, path: &Path) {
+    fn visit_inode(&mut self, id: u64, path: &Path, path_to_find: &Path) {
+        // eprintln!("path: {path:?}");
+        // eprintln!("path_to_find: {path_to_find:?}");
+
+        if !path_to_find.starts_with(path) {
+            return;
+        }
+
         let inode = self.image.inode(id);
         let segment = match inode {
             InodeType::Compact(inode) => SegmentType::CompactInode(inode),
@@ -177,12 +185,12 @@ impl<'img> ImageVisitor<'img> {
             let inline = inode.inline();
             if !inline.is_empty() {
                 let inline_block = DirectoryBlock::ref_from_bytes(inode.inline()).unwrap();
-                self.visit_directory_block(inline_block, path);
+                self.visit_directory_block(inline_block, path, &path_to_find);
             }
 
             for id in inode.blocks(self.image.blkszbits) {
                 let block = self.image.directory_block(id);
-                self.visit_directory_block(block, path);
+                self.visit_directory_block(block, path, &path_to_find);
                 self.note(SegmentType::DirectoryBlock(block), Some(path));
             }
         } else {
@@ -202,7 +210,31 @@ impl<'img> ImageVisitor<'img> {
         };
         this.note(SegmentType::Header(image.header), None);
         this.note(SegmentType::Superblock(image.sb), None);
-        this.visit_inode(image.sb.root_nid.get() as u64, &PathBuf::from("/"));
+        this.visit_inode(
+            image.sb.root_nid.get() as u64,
+            &PathBuf::from("/"),
+            &PathBuf::from("/etc/bluetooth"),
+        );
+        this.visited
+    }
+
+    fn get_file(image: &'img Image<'img>) -> BTreeMap<usize, (SegmentType<'img>, Vec<Box<Path>>)> {
+        let mut this = Self {
+            image,
+            visited: BTreeMap::new(),
+        };
+        let header_noted = this.note(SegmentType::Header(image.header), None);
+        eprintln!("header_noted: {header_noted}");
+
+        let superblock_noted = this.note(SegmentType::Superblock(image.sb), None);
+        eprintln!("superblock_noted: {superblock_noted}");
+
+        this.visit_inode(
+            image.sb.root_nid.get() as u64,
+            &PathBuf::from("/"),
+            &PathBuf::from("/etc/bluetooth"),
+        );
+
         this.visited
     }
 }
@@ -423,10 +455,19 @@ pub fn dump_unassigned(
 
 pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
     let image = Image::open(data);
-    let visited = ImageVisitor::visit_image(&image);
+    let visited = ImageVisitor::get_file(&image);
+
+    eprintln!("sizeof visited: {}", std::mem::size_of_val(&visited));
+    eprintln!("len visited: {}", visited.len());
 
     let inode_start = (image.sb.meta_blkaddr.get() as usize) << image.sb.blkszbits;
+    eprintln!("image.sb.meta_blkaddr: {}", image.sb.meta_blkaddr.get());
+
     let xattr_start = (image.sb.xattr_blkaddr.get() as usize) << image.sb.blkszbits;
+    eprintln!("image.sb.xattr_blkaddr: {}", image.sb.xattr_blkaddr.get());
+
+    eprintln!("inode_start: {inode_start}");
+    eprintln!("root_nide: {}", image.sb.root_nid.get());
 
     let mut space_stats = BTreeMap::new();
     let mut padding_stats = BTreeMap::new();
@@ -496,6 +537,8 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
 
         offset += segment.size();
     }
+
+    return Ok(());
 
     if offset < data.len() {
         let unassigned = &data[offset..];

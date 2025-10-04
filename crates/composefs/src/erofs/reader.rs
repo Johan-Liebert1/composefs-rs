@@ -288,8 +288,27 @@ impl<'img> Image<'img> {
         let blkszbits = sb.blkszbits;
         let block_size = 1usize << blkszbits;
         assert!(block_size != 0);
+        eprintln!("sb.meta_blkaddr.get(): {:#?}", sb.meta_blkaddr.get());
+        eprintln!("sb.xattr_blkaddr.get(): {:#?}", sb.xattr_blkaddr.get());
         let inodes = &image[sb.meta_blkaddr.get() as usize * block_size..];
         let xattrs = &image[sb.xattr_blkaddr.get() as usize * block_size..];
+
+        if inodes[..1000] == image[..1000] {
+            eprintln!("first 100 of inode same as image")
+        }
+
+        if xattrs[..1000] == image[..1000] {
+            eprintln!("first 100 of xattrs same as image")
+        }
+
+        if inodes == xattrs {
+            eprintln!("inode == xattrs")
+        }
+
+        if xattrs == image {
+            eprintln!("xattrs == file")
+        }
+
         Image {
             image,
             header,
@@ -302,6 +321,20 @@ impl<'img> Image<'img> {
     }
 
     pub fn inode(&self, id: u64) -> InodeType<'_> {
+        if id == self.sb.root_nid.get().into() {
+            let start = id as usize * 32;
+            eprintln!(
+                "=========> &self.inodes[{}..{}] {:?}\n",
+                start,
+                start + 64,
+                &self.inodes[start..start + 64]
+            );
+
+            if self.image == self.inodes {
+                eprintln!("image is same as inodes indoe func\n")
+            }
+        }
+
         let inode_data = &self.inodes[id as usize * 32..];
         if inode_data[0] & 1 != 0 {
             let header = ExtendedInodeHeader::ref_from_bytes(&inode_data[..64]).unwrap();
@@ -559,7 +592,12 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
 }
 
 pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<HashSet<ObjectID>> {
+    println!("image len: {}", image.len());
     let img = Image::open(image);
+
+    println!("img header: {:#?}", img.header);
+    println!("img sb: {:#?}", img.sb);
+
     let mut this = ObjectCollector {
         visited_nids: HashSet::new(),
         nids_to_visit: BTreeSet::new(),
