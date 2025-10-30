@@ -30,6 +30,18 @@ use composefs::{
 
 use crate::tar::get_entry;
 
+/// Result of pulling a container image, indicating whether it was already present or newly fetched.
+///
+/// This enum represents the outcome of an image pull operation, providing both the content
+/// hash (SHA256) and the fs-verity object identifier for the image.
+#[derive(Debug)]
+pub enum ImagePull<ObjectID> {
+    /// The image was already present in the repository and did not need to be pulled.
+    Present(ContentAndVerity<ObjectID>),
+    /// The image was newly pulled and added to the repository.
+    Fetched(ContentAndVerity<ObjectID>)
+}
+
 type ContentAndVerity<ObjectID> = (Sha256Digest, ObjectID);
 
 pub(crate) fn sha256_from_descriptor(descriptor: &Descriptor) -> Result<Sha256Digest> {
@@ -85,7 +97,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
-) -> Result<(Sha256Digest, ObjectID)> {
+) -> Result<ImagePull<ObjectID>> {
     skopeo::pull(repo, imgref, reference, img_proxy_config).await
 }
 

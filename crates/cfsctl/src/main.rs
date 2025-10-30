@@ -253,8 +253,13 @@ async fn main() -> Result<()> {
                 println!("{}", image_id.to_id());
             }
             OciCommand::Pull { ref image, name } => {
-                let (sha256, verity) =
+                let result =
                     composefs_oci::pull(&Arc::new(repo), image, name.as_deref(), None).await?;
+
+                let (sha256, verity) = match result {
+                    composefs_oci::ImagePull::Present(p) => p,
+                    composefs_oci::ImagePull::Fetched(f) => f,
+                };
 
                 println!("sha256 {}", hex::encode(sha256));
                 println!("verity {}", verity.to_hex());

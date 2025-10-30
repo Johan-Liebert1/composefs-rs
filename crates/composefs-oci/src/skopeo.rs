@@ -24,7 +24,8 @@ use composefs::{
     fsverity::FsVerityHashValue, repository::Repository, splitstream::DigestMap, util::Sha256Digest,
 };
 
-use crate::{sha256_from_descriptor, sha256_from_digest, tar::split_async, ContentAndVerity};
+use crate::ImagePull;
+use crate::{sha256_from_descriptor, sha256_from_digest, tar::split_async};
 
 struct ImageOp<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
@@ -134,7 +135,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         self: &Arc<Self>,
         manifest_layers: &[Descriptor],
         descriptor: &Descriptor,
-    ) -> Result<ContentAndVerity<ObjectID>> {
+    ) -> Result<ImagePull<ObjectID>> {
         let config_sha256 = sha256_from_descriptor(descriptor)?;
         if let Some(config_id) = self.repo.check_stream(&config_sha256)? {
             // We already got this config?  Nice.
@@ -142,7 +143,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 "Already have container config {}",
                 hex::encode(config_sha256)
             ))?;
-            Ok((config_sha256, config_id))
+            Ok(ImagePull::Present((config_sha256, config_id)))
         } else {
             // We need to add the config to the repo.  We need to parse the config and make sure we
             // have all of the layers first.
@@ -194,11 +195,11 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             splitstream.write_inline(&raw_config);
             let config_id = self.repo.write_stream(splitstream, None)?;
 
-            Ok((config_sha256, config_id))
+            Ok(ImagePull::Fetched((config_sha256, config_id)))
         }
     }
 
-    pub async fn pull(self: &Arc<Self>) -> Result<ContentAndVerity<ObjectID>> {
+    pub async fn pull(self: &Arc<Self>) -> Result<ImagePull<ObjectID>> {
         let (_manifest_digest, raw_manifest) = self
             .proxy
             .fetch_manifest_raw_oci(&self.img)
@@ -223,15 +224,20 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
-) -> Result<(Sha256Digest, ObjectID)> {
+) -> Result<ImagePull<ObjectID>> {
     let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
-    let (sha256, id) = op
+    let pull_result = op
         .pull()
         .await
         .with_context(|| format!("Unable to pull container image {imgref}"))?;
 
+    let sha256 = match pull_result {
+        ImagePull::Present((sha, ..)) => sha,
+        ImagePull::Fetched((sha, ..)) => sha,
+    };
+
     if let Some(name) = reference {
         repo.name_stream(sha256, name)?;
     }
-    Ok((sha256, id))
+    Ok(pull_result)
 }
