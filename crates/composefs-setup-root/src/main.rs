@@ -16,18 +16,18 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use hex::FromHexError;
 use rustix::{
-    fs::{major, minor, mkdirat, openat, stat, symlink, Mode, OFlags, CWD},
+    fs::{CWD, Mode, OFlags, major, minor, mkdirat, openat, stat, symlink},
     io::Errno,
     mount::{
-        fsconfig_create, fsconfig_set_string, fsmount, open_tree, unmount, FsMountFlags,
-        MountAttrFlags, OpenTreeFlags, UnmountFlags,
+        FsMountFlags, MountAttrFlags, OpenTreeFlags, UnmountFlags, fsconfig_create,
+        fsconfig_set_string, fsmount, open_tree, unmount,
     },
 };
 use serde::Deserialize;
 
 use composefs::{
     fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue},
-    mount::{mount_at, FsHandle},
+    mount::{FsHandle, mount_at},
     mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
     repository::Repository,
 };
@@ -179,7 +179,12 @@ fn open_root_fs(path: &Path) -> Result<OwnedFd> {
 }
 
 fn mount_composefs_image(sysroot: &OwnedFd, name: &str, insecure: bool) -> Result<OwnedFd> {
-    let mut repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
+    let repo = match name.len() {
+        128 => Box::new(Repository::<Sha512HashValue>::open_path(sysroot, "composefs")?),
+        64 => Box::new(Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?),
+        _ => anyhow::bail!("Invalid composefs digest length: {}", name.len()),
+    };
+
     repo.set_insecure(insecure);
     repo.mount(name).context("Failed to mount composefs image")
 }

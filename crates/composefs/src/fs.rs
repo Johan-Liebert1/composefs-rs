@@ -339,7 +339,7 @@ pub fn read_filesystem<ObjectID: FsVerityHashValue>(
         inodes: HashMap::new(),
     };
 
-    let root = reader.read_directory(dirfd, path.as_os_str())?;
+    let root = reader.read_directory(dirfd, path.as_os_str()).context("read directory")?;
 
     Ok(FileSystem { root })
 }
@@ -371,7 +371,7 @@ where
     ObjectID: FsVerityHashValue,
     F: Fn(&OsStr) -> bool,
 {
-    let fs = read_filesystem(dirfd, path, repo)?;
+    let fs = read_filesystem(dirfd, path, repo).context("Read filesystem")?;
     fs.filter_xattrs(xattr_filter);
     Ok(fs)
 }
@@ -421,8 +421,8 @@ pub fn read_container_root<ObjectID: FsVerityHashValue>(
     path: &Path,
     repo: Option<&Repository<ObjectID>>,
 ) -> Result<FileSystem<ObjectID>> {
-    let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr)?;
-    fs.transform_for_oci()?;
+    let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr).context("read_filesystem_filtered")?;
+    fs.transform_for_oci().context("transform_for_oci")?;
     Ok(fs)
 }
 
