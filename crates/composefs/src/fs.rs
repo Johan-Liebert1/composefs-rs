@@ -11,30 +11,34 @@ use std::{
     fs::File,
     io::{Read, Write},
     mem::MaybeUninit,
-    os::unix::ffi::OsStrExt,
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::Path,
     rc::Rc,
 };
 
-use anyhow::{ensure, Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 use rustix::{
     buffer::spare_capacity,
     fd::{AsFd, OwnedFd},
     fs::{
-        fstat, getxattr, linkat, listxattr, mkdirat, mknodat, openat, readlinkat, symlinkat,
-        AtFlags, Dir, FileType, Mode, OFlags, CWD,
+        AtFlags, CWD, Dir, FileType, Mode, OFlags, fstat, getxattr, linkat, listxattr, mkdirat,
+        mknodat, openat, readlink, readlinkat, symlinkat,
     },
-    io::{read, Errno},
+    io::{Errno, read},
 };
 use zerocopy::IntoBytes;
 
 use crate::{
-    fsverity::{compute_verity, FsVerityHashValue},
+    INLINE_CONTENT_MAX,
+    fsverity::{FsVerityHashValue, compute_verity},
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
     util::proc_self_fd,
-    INLINE_CONTENT_MAX,
 };
+
+fn readlink_helper(fd: impl AsFd) -> rustix::io::Result<std::ffi::CString> {
+    readlink(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd()), [])
+}
 
 /// Attempt to use O_TMPFILE + rename to atomically set file contents.
 /// Will fall back to a non-atomic write if the target doesn't support O_TMPFILE.
@@ -286,16 +290,28 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
     /// if one was provided.
     fn read_directory(&mut self, dirfd: impl AsFd, name: &OsStr) -> Result<Directory<ObjectID>> {
         let fd = openat(
-            dirfd,
+            &dirfd,
             name,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "openat fd: {:#?}. Dir: {:?}. Opening: {name:?}",
+                dirfd.as_fd(),
+                readlink_helper(&dirfd)
+            )
+        })?;
 
-        let (_, stat) = Self::stat(&fd, FileType::Directory)?;
+        let (_, stat) = Self::stat(&fd, FileType::Directory)
+            .with_context(|| format!("stat failed: {:?}", readlink_helper(&dirfd)))?;
+
         let mut directory = Directory::new(stat);
 
-        for item in Dir::read_from(&fd)? {
+        for item in Dir::read_from(&fd).context(format!(
+            "Reading from fd {fd:?}. path: {:?}",
+            readlink_helper(&fd)
+        ))? {
             let entry = item?;
             let name = OsStr::from_bytes(entry.file_name().to_bytes());
 
@@ -303,7 +319,9 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
                 continue;
             }
 
-            let inode = self.read_inode(&fd, name, entry.file_type())?;
+            let inode = self
+                .read_inode(&fd, name, entry.file_type())
+                .context(format!("Reading inode for {name:?}, dirent: {entry:?}"))?;
             directory.insert(name, inode);
         }
 
@@ -339,7 +357,9 @@ pub fn read_filesystem<ObjectID: FsVerityHashValue>(
         inodes: HashMap::new(),
     };
 
-    let root = reader.read_directory(dirfd, path.as_os_str()).context("read directory")?;
+    let root = reader
+        .read_directory(dirfd, path.as_os_str())
+        .context("read directory")?;
 
     Ok(FileSystem { root })
 }
@@ -421,7 +441,8 @@ pub fn read_container_root<ObjectID: FsVerityHashValue>(
     path: &Path,
     repo: Option<&Repository<ObjectID>>,
 ) -> Result<FileSystem<ObjectID>> {
-    let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr).context("read_filesystem_filtered")?;
+    let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr)
+        .context("read_filesystem_filtered")?;
     fs.transform_for_oci().context("transform_for_oci")?;
     Ok(fs)
 }
@@ -449,7 +470,7 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustix::fs::{openat, CWD};
+    use rustix::fs::{CWD, openat};
 
     #[test]
     fn test_write_contents() -> Result<()> {
