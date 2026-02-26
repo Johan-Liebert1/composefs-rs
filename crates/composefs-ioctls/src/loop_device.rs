@@ -11,7 +11,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, OwnedFd},
 };
 
-use rustix::ioctl::{ioctl, opcode, Opcode, Setter};
+use rustix::ioctl::{ioctl, Opcode, Setter};
 
 /// Flags for loop device configuration.
 pub mod flags {
@@ -102,9 +102,9 @@ unsafe impl rustix::ioctl::Ioctl for LoopCtlGetFree {
     }
 }
 
-const LOOP_CTL_GET_FREE: Opcode = opcode::none(0x4C, 0x82);
+const LOOP_CTL_GET_FREE: Opcode = 0x4C82;
 // #define LOOP_CONFIGURE         0x4C0A
-const LOOP_CONFIGURE: Opcode = opcode::write::<LoopConfig>(0x4C, 0x0A);
+const LOOP_CONFIGURE: Opcode = 0x4C0A;
 
 /// Creates a loop device backed by the given file.
 ///
